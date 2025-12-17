@@ -1,6 +1,6 @@
 #!/bin/bash
 # NiiXscan
-# Version 3.0
+# Version 3.0 
 # Created by techniix / tomteal
 
 # =====================[ ENTERPRISE CONFIGURATION ]=====================
@@ -150,8 +150,8 @@ declare -A TOOL_PATHS=(
 initialize_platform() {
     echo -e "${PURPLE}"
     echo "╔══════════════════════════════════════════════════════╗"
-    echo "║                NiiXscan v3.0 - Initializing          ║"
-    echo "║         AI-Powered Enterprise Security Platform      ║"
+    echo "║              		  NiiXscan v3.0 - Initializing     	    		      ║"
+    echo "║         				   Security Platform     						  ║"
     echo "╚══════════════════════════════════════════════════════╝"
     echo -e "${NC}"
     
