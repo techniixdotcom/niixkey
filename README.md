@@ -1,6 +1,10 @@
+DUE TO WPA3 THIS DOEWS NOT WORK .... 
+
+
+
 direct run on debian based systems
 
-love chillis love it hot, but fuck the root rot
+love chillis love it hot, but fuck the root
 
 
 
