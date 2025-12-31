@@ -2,7 +2,7 @@
 
 work in progress
 
-love chillis love it hot, but fuck the root
+love chillis, love it hot 
 
 work in progress
 
