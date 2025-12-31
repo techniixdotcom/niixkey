@@ -2,7 +2,7 @@
 
 # NiiX key - WiFi Cracking Script
 # Created by: cuteLiLi / techniix
-# Version: b2.0
+# Version: beta 1.61
 
 import subprocess
 from collections import namedtuple
